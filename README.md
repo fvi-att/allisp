@@ -24,7 +24,7 @@
 
 このリポジトリには個人用の設定、IDE 設定、オラクルキャッシュ、実行結果を含めない。
 これらは `.gitignore` の対象であり、生成物には入力内容やローカルパスが含まれる場合があるため、公開前に内容を確認すること。
-ライセンスは [MIT License](LICENSE) である。
+ライセンスは [GNU General Public License v3.0](LICENSE)（GPL-3.0-only）である。
 
 - 言語仕様（実行境界、`llm`、`pure`、`@use`、エラー値、キャッシュ）：[docs/language.md](docs/language.md)
 - 開発ガイド（テスト、ソース構成、バックエンドの差し替え）：[docs/development.md](docs/development.md)
