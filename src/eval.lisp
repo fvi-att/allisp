@@ -210,7 +210,8 @@ Returns the value or +MISSING+."
     "LET" "LET*" "LAMBDA" "PROGN" "AND" "OR"
     "DEFUN" "DEFINE" "DEFMACRO" "DEF" "DEFVAR" "DEFPARAMETER"
     "SETQ" "SETF" "PUSH" "INCF" "DECF"
-    "@USE" "LLM" "PURE" "%GENERATE-FILE" "%GOAL" "%SOLVE" "%CONSTRAINT"))
+    "@USE" "LLM" "PURE" "DEFER" "DEPRECATE"
+    "%GENERATE-FILE" "%GOAL" "%SOLVE" "%CONSTRAINT"))
 
 (defparameter +special-forms+
   (let ((h (make-hash-table :test #'eq)))
@@ -328,6 +329,17 @@ Returns the value or +MISSING+."
                  (unbound form env effect)))))
         ((is "@USE") (eval-use form env))
         ((is "LLM") (eval-llm form env))
+        ((is "DEFER")
+         ;; Preserve the decision's code verbatim.  The remaining arguments
+         ;; are metadata and are evaluated so a reason can refer to bindings.
+         (cons op (cons (first rest) (eval-metadata (cdr rest) env))))
+        ((is "DEPRECATE")
+         ;; Unlike DEFER, deprecated code still runs.  Keep the evaluated
+         ;; result in a tagged S-expression so the deprecation decision and
+         ;; its metadata survive in result files and later compositions.
+         (list* op (a-eval (first rest) env effect)
+                :deprecated t
+                (eval-metadata (cdr rest) env)))
         ((is "%GENERATE-FILE") (eval-generate-file form env))
         ((is "%GOAL") (eval-goal form env))
         ((is "%SOLVE") (eval-solve form env))
@@ -336,6 +348,12 @@ Returns the value or +MISSING+."
          (let ((*pure* t))
            (eval-body rest env effect)))
         (t (unbound form env effect))))))
+
+(defun eval-metadata (metadata env)
+  "Evaluate metadata values while retaining their plist layout.
+Keywords are self-evaluating, so `(defer code :reason reason)` retains the
+`:reason` key and resolves REASON without ever evaluating CODE."
+  (mapcar (lambda (item) (a-eval item env)) metadata))
 
 (defun eval-let (rest env effect sequential)
   (destructuring-bind (bindings &rest body) rest

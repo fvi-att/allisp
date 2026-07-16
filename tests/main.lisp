@@ -117,6 +117,23 @@ Returns (values last-value run)."
     (is (eq v (rd "ok")))
     (is (= 1 (calls run)))))
 
+(test defer-preserves-code-and-evaluates-its-metadata
+  (multiple-value-bind (v run)
+      (ev "(let ((reason \"waiting for approval\"))
+             (defer (send-email customer) :reason reason))")
+    (is (equal v
+               (rd "(defer (send-email customer) :reason \"waiting for approval\")")))
+    ;; Neither the deferred operator nor its arguments may reach the oracle.
+    (is (= 0 (calls run)))))
+
+(test deprecate-evaluates-code-and-retains-metadata
+  (multiple-value-bind (v run)
+      (ev "(let ((reason \"use new-total instead\"))
+             (deprecate (+ 20 22) :reason reason))")
+    (is (equal v
+               (rd "(deprecate 42 :deprecated t :reason \"use new-total instead\")")))
+    (is (= 0 (calls run)))))
+
 (test effect-position-escalates
   ;; (mystery x) sits in effect position; the whole LET must be oracled once
   (multiple-value-bind (v run)

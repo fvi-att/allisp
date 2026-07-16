@@ -142,5 +142,14 @@
   思考用 DSL の自由な記法を許容するためである。
 - `t` と `nil` 以外の CL シンボルは見えない。
   許可リストにない名前は、確実にオラクルへ渡る。
-- **特殊形式**：`quote`、`quasiquote`、`if`、`cond`、`when`、`unless`、`let`、`let*`、`lambda`、`progn`、`and`、`or`、`defun`、`define`、`defmacro`、`def`、`defvar`、`defparameter`、`setq`、`setf`、`push`、`incf`、`decf`、`@use`、`llm`、`pure`
+- **特殊形式**：`quote`、`quasiquote`、`if`、`cond`、`when`、`unless`、`let`、`let*`、`lambda`、`progn`、`and`、`or`、`defun`、`define`、`defmacro`、`def`、`defvar`、`defparameter`、`setq`、`setf`、`push`、`incf`、`decf`、`@use`、`llm`、`pure`、`defer`、`deprecate`
+
+### 保留・非推奨の判断
+
+- `(defer code :reason reason ...)` は `code` を評価せず、コードと評価済みのメタデータを
+  `(defer code :reason value ...)` として返す。`code` は結果に残るため、保留した判断を後から
+  再開できる。
+- `(deprecate code :reason reason ...)` は `code` を通常どおり評価し、評価結果を
+  `(deprecate value :deprecated t :reason value ...)` として返す。これにより、非推奨である
+  こととその理由を、評価後も結果 S 式に残せる。
 - **組み込みマクロ**：`generate-file`、`goal`、`constraint`、`solve`

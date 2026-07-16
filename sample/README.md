@@ -11,6 +11,7 @@ Each file is standalone and demonstrates one evaluation path.
 | `05-solve-deterministic.lisp` | Recursive `goal` rules and deterministic `solve` deduction. |
 | `06-solve-llm-goal.lisp` | One LLM review result is used as input to a deterministic logic goal. |
 | `07-solve-constraints.lisp` | `constraint` filters branches after logic variables are bound. |
+| `08-defer-deprecate.lisp` | Preserves a deferred, unevaluated decision and marks an evaluated result as deprecated. |
 
 Inspect the oracle boundary without making an LLM call:
 
@@ -22,6 +23,7 @@ bin/allisp run sample/04-generate-file.lisp --dry-run
 bin/allisp run sample/05-solve-deterministic.lisp --dry-run
 bin/allisp run sample/06-solve-llm-goal.lisp --dry-run
 bin/allisp run sample/07-solve-constraints.lisp --dry-run
+bin/allisp run sample/08-defer-deprecate.lisp --dry-run
 ```
 
 Run a sample with the authenticated `claude` CLI:
