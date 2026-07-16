@@ -1,0 +1,21 @@
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#|
+exec ros -Q -- $0 "$@"
+|#
+(progn
+  (ros:ensure-asdf)
+  ;; Register the project (this script lives in <project>/bin/).
+  (push (uiop:pathname-parent-directory-pathname
+         (uiop:pathname-directory-pathname
+          (uiop:ensure-absolute-pathname *load-pathname* (uiop:getcwd))))
+        asdf:*central-registry*)
+  #+quicklisp (ql:quickload '(:allisp) :silent t))
+
+(defpackage :ros.script.allisp
+  (:use :cl))
+(in-package :ros.script.allisp)
+
+(defun main (&rest argv)
+  (allisp:main argv))
+;;; vim: set ft=lisp lisp:

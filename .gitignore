@@ -1,0 +1,11 @@
+.allisp/
+**/output/
+dist/
+.idea/
+.claude/
+.DS_Store
+.env
+.env.*
+!.env.example
+**/*.trace.lisp
+**/*.result.lisp
