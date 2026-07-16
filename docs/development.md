@@ -21,6 +21,7 @@ src/
 ├── env.lisp        # 環境、クロージャ、マクロ、run 状態、エラー値
 ├── backend.lisp    # backend-complete protocol（Claude Code CLI とテスト用 mock）
 ├── cache.lisp      # sha256 キーによる永続キャッシュ
+├── plugin.lisp     # Git/ASDF プラグインの取得とホスト実装の構文マクロ登録
 ├── eval.lisp       # メタ循環評価器、特殊形式、オラクル、文脈の同梱、エスカレーション
 ├── builtins.lisp   # CL の許可リストにあるビルトイン
 ├── runner.lisp     # run-file、run-one-liner、result と trace の書き出し
@@ -43,6 +44,52 @@ Anthropic API を直接呼び出す実装に切り替える場合は、このメ
 そのインスタンスを `run-file` または `run-one-liner` の `:backend` に渡せばよい。
 キャッシュキーはプロンプトとモデルから決まる。
 このため、同じプロンプトとモデルを使うバックエンド間ではキャッシュを共有する。
+
+## 構文プラグイン
+
+起動時に `--plugin <git-url[#revision]>` を渡すと、allisp はリポジトリを
+プロジェクトの `.allisp/plugins/` に取得し、ASDF システムをロードする。プラグインは
+ホスト Common Lisp を実行するため、信頼できるリポジトリだけを指定する。運用では URL の
+末尾に完全なコミットハッシュを `#` で指定して固定する。
+
+```sh
+bin/allisp run thought.lisp \
+  --plugin 'https://github.com/acme/allisp-review-syntax.git#<commit-sha>'
+```
+
+リポジトリのルートには、通常の `.asd` に加え、ロード対象を明示する
+`.allisp-plugin/plugin.lisp` を置く。
+
+```lisp
+(:system "acme-allisp-review-syntax"
+ :asd "acme-allisp-review-syntax.asd")
+```
+
+ASDF システムは `allisp` に依存させ、専用パッケージから `define-syntax-macro` を import
+する。展開関数は未評価の allisp 引数を受け取り、評価器が実行する allisp フォームを一つ
+返す。これは SBCL のコンパイル済み ASDF コンポーネントとして配布・テストでき、プラグイン
+間のシンボル衝突も避けられる。
+
+```lisp
+;; acme-allisp-review-syntax.asd
+(asdf:defsystem "acme-allisp-review-syntax"
+  :depends-on ("allisp")
+  :serial t
+  :components ((:file "syntax")))
+
+;; syntax.lisp
+(defpackage #:acme.allisp.review-syntax
+  (:use #:cl)
+  (:import-from #:allisp #:define-syntax-macro))
+(in-package #:acme.allisp.review-syntax)
+
+(define-syntax-macro when-present ((value form) &body body)
+  `(let ((,value ,form))
+     (when ,value ,@body)))
+```
+
+この例により、allisp 側では `(when-present (report (read-report id)) ...)` と書ける。
+外部マクロは各評価環境の生成時に登録され、通常の allisp `defmacro` と同様に展開される。
 
 ## ビルド時の Roswell の問題
 

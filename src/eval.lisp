@@ -50,6 +50,7 @@
                    (values (a-eval op env) t))
              (cond
                ((not found) (unbound form env effect))
+               ((syntax-macro-p fn) (expand-syntax-and-eval fn form env effect))
                ((macro-obj-p fn) (expand-and-eval fn form env effect))
                (t (a-apply fn (mapcar (lambda (a) (a-eval a env)) (cdr form)))))))))))
 
@@ -174,6 +175,16 @@ Returns the value or +MISSING+."
               ;; Escalation inside the expansion lands on the original call —
               ;; the readable, cache-stable unit the author actually wrote.
               (oracle-eval form env)))))))
+
+(defun expand-syntax-and-eval (macro form env effect)
+  "Expand a host-provided syntax macro over raw allisp arguments."
+  (let ((expansion (normalize (apply (syntax-macro-expander macro) (cdr form)))))
+    (if effect
+        (%eval expansion env t)
+        (handler-case (%eval expansion env nil)
+          (escalate-request (c)
+            (declare (ignore c))
+            (oracle-eval form env))))))
 
 ;; ---------------------------------------------------------------- quasiquote
 

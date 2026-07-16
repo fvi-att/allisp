@@ -93,4 +93,5 @@ name (symbols and keywords match each other) and return the next element."
   (let ((env (make-env)))
     (loop for (name fn) on +builtins+ by #'cddr
           do (env-define env (usym name) fn))
+    (install-syntax-macros env)
     (install-core-macros env)))

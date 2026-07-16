@@ -2,7 +2,8 @@
 
 (defpackage #:allisp
   (:use #:cl)
-  (:export #:main #:run-file #:run-one-liner))
+  (:export #:main #:run-file #:run-one-liner
+           #:define-syntax-macro #:register-syntax-macro))
 
 ;; The package all allisp user code is read into. Uses nothing: every symbol
 ;; in a thought file is a fresh allisp symbol, never a CL one, so the

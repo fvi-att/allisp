@@ -134,6 +134,19 @@ Returns (values last-value run)."
                (rd "(deprecate 42 :deprecated t :reason \"use new-total instead\")")))
     (is (= 0 (calls run)))))
 
+(test host-syntax-macro-expands-before-evaluation
+  (let ((name (allisp::usym "DUPLICATE-FOR-TEST")))
+    (unwind-protect
+         (progn
+           (allisp:register-syntax-macro
+            "duplicate-for-test"
+            (lambda (form) `(list ,form ,form)))
+           (multiple-value-bind (v run)
+               (ev "(duplicate-for-test (+ 20 1))")
+             (is (equal v '(21 21)))
+             (is (= 0 (calls run)))))
+      (remhash name allisp::*syntax-macros*))))
+
 (test effect-position-escalates
   ;; (mystery x) sits in effect position; the whole LET must be oracled once
   (multiple-value-bind (v run)

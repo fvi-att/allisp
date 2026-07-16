@@ -48,7 +48,7 @@ use FILE's directory."
         (format out "~%~%")))
     (values result-path trace-path)))
 
-(defun run-file (path &key refresh strict dry-run model backend)
+(defun run-file (path &key refresh strict dry-run model backend plugins)
   "Evaluate PATH as an allisp file. Writes result/trace next to it under
 output/. Returns the exit code (0 = no errors)."
   (let* ((source (truename path))
@@ -58,6 +58,7 @@ output/. Returns the exit code (0 = no errors)."
                           :backend (or backend (make-instance 'claude-cli-backend))
                           :refresh refresh :strict strict :dry-run dry-run))
          (*current-file* source)
+         (_ (load-plugins plugins root))
          (env (make-global-env))
          (forms (read-allisp-file source))
          (total (length forms))
@@ -87,7 +88,7 @@ output/. Returns the exit code (0 = no errors)."
               (namestring result-path) (namestring trace-path) aborted))
     (if (or aborted (run-errors *run*)) 1 0)))
 
-(defun run-one-liner (source-text &key refresh strict dry-run model backend root)
+(defun run-one-liner (source-text &key refresh strict dry-run model backend root plugins)
   "Evaluate the allisp forms in SOURCE-TEXT and print the final value.
 Returns the exit code (0 = no errors). No result or trace files are written."
   (let* ((root (or root (find-project-root (uiop:getcwd))))
@@ -96,6 +97,7 @@ Returns the exit code (0 = no errors). No result or trace files are written."
                           :backend (or backend (make-instance 'claude-cli-backend))
                           :refresh refresh :strict strict :dry-run dry-run))
          (*current-file* nil)
+         (_ (load-plugins plugins root))
          (env (make-global-env))
          (forms (read-allisp-string-all source-text))
          (value nil)

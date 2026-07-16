@@ -9,6 +9,7 @@
                (:file "env")
                (:file "backend")
                (:file "cache")
+               (:file "plugin")
                (:file "eval")
                (:file "builtins")
                (:file "runner")
