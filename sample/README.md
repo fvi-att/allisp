@@ -12,6 +12,7 @@ Each file is standalone and demonstrates one evaluation path.
 | `06-solve-llm-goal.lisp` | One LLM review result is used as input to a deterministic logic goal. |
 | `07-solve-constraints.lisp` | `constraint` filters branches after logic variables are bound. |
 | `08-defer-deprecate.lisp` | Preserves a deferred, unevaluated decision and marks an evaluated result as deprecated. |
+| `09-executable-adr.lisp` | An executable ADR: premises are `def` data, decisions are oracle forms. Editing one premise re-runs only the dependent decision. |
 
 Inspect the oracle boundary without making an LLM call:
 
@@ -24,6 +25,7 @@ bin/allisp run sample/05-solve-deterministic.lisp --dry-run
 bin/allisp run sample/06-solve-llm-goal.lisp --dry-run
 bin/allisp run sample/07-solve-constraints.lisp --dry-run
 bin/allisp run sample/08-defer-deprecate.lisp --dry-run
+bin/allisp run sample/09-executable-adr.lisp --dry-run
 ```
 
 Run a sample with the authenticated `claude` CLI:
@@ -32,6 +34,7 @@ Run a sample with the authenticated `claude` CLI:
 bin/allisp run sample/02-llm-oracle.lisp
 bin/allisp run sample/03-macro-oracle-deterministic.lisp
 bin/allisp run sample/06-solve-llm-goal.lisp
+bin/allisp run sample/09-executable-adr.lisp
 ```
 
 Generate and execute a program without an LLM call:
@@ -63,3 +66,21 @@ score of `58` from the deterministic `(+ 70 -12)` expression.
 
 The oracle returns a value, not executable code. The macro supplies the code
 that consumes that value, keeping the final processing deterministic.
+
+## Premise-change replay (executable ADR)
+
+The ninth sample records an architecture decision as three `def` premises and
+two oracle decisions. The oracle cache key includes the bindings each form
+references, so editing one premise invalidates only the decisions that depend
+on it:
+
+```sh
+bin/allisp run sample/09-executable-adr.lisp   # first run:  2 misses
+bin/allisp run sample/09-executable-adr.lisp   # replay:     2 hits, no LLM call
+# edit budget-premise (e.g. 800 → 600), then:
+bin/allisp run sample/09-executable-adr.lisp   # 1 miss (decision), 1 hit (revisit-triggers)
+```
+
+`decision` references all three premises and is re-thought. `revisit-triggers`
+references only `team-premise` and replays from cache. Reverting the premise
+restores the original cache entry, so the next run is again 2 hits.

@@ -190,6 +190,56 @@ Returns (values last-value run)."
       (is (search "Collect observations." prompt))
       (is (search "(obs foo (x 1))" prompt)))))
 
+(test claude-cli-args-agentic-allows-read-only-tools
+  (let ((agentic (allisp::claude-cli-args
+                  (make-instance 'allisp::claude-cli-backend) "sonnet"))
+        (plain (allisp::claude-cli-args
+                (make-instance 'allisp::claude-cli-backend :agentic nil)
+                "sonnet")))
+    (is (member "--allowedTools" agentic :test #'string=))
+    (is (member "Read" agentic :test #'string=))
+    (is (member "--strict-mcp-config" agentic :test #'string=))
+    (is (not (member "--allowedTools" plain :test #'string=)))
+    (is (equal '("claude" "-p" "--model" "sonnet") plain))))
+
+(test agentic-prompt-includes-environment-and-anti-echo
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "think.lisp" root)))
+         (run (make-test-run :root root :responses '("(:ok)"))))
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (allisp::eval-toplevel-form (rd "(mystery 1)") env))
+    (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
+      (is (search "=== Environment ===" prompt))
+      (is (search (namestring source) prompt))
+      (is (search (namestring root) prompt))
+      (is (search "Read, Glob, and Grep" prompt))
+      (is (search "never a restatement" prompt)))))
+
+(test non-agentic-prompt-has-no-environment
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "think.lisp" root)))
+         (run (allisp::make-run
+               :root root :model "sonnet"
+               :backend (make-instance 'allisp::mock-backend
+                                       :responses '("(:ok)") :agentic nil))))
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (allisp::eval-toplevel-form (rd "(mystery 1)") env))
+    (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
+      (is (not (search "=== Environment ===" prompt)))
+      ;; the anti-echo rule is unconditional
+      (is (search "never a restatement" prompt)))))
+
+(test one-liner-prompt-has-no-environment
+  ;; no source file to explore from -> no exploration section
+  (multiple-value-bind (v run) (ev "(mystery 1)" :responses '("(:ok)"))
+    (declare (ignore v))
+    (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
+      (is (not (search "=== Environment ===" prompt))))))
+
 (test use-imports-definitions
   (let* ((root (fresh-root))
          (lib (merge-pathnames "lib.lisp" root)))
@@ -335,3 +385,124 @@ Returns (values last-value run)."
     (is (= v 10))
     (is (= 1 (length (allisp::run-errors run))))
     (is (= 3 (calls run)))))
+
+(test def-returns-bound-value
+  ;; (def name expr) returns the bound value so result files record it and
+  ;; (result ...) replay can restore the binding. defun keeps returning the
+  ;; name: closures cannot be externalized, so there is nothing to replay.
+  (multiple-value-bind (v run) (ev "(def x (+ 1 2))")
+    (is (= v 3))
+    (is (= 0 (calls run))))
+  (is (equal (rd "(1 2)") (ev "(def x 1 2)")))
+  (is (= 5 (ev "(define y 5)")))
+  (is (eq (rd "f") (ev "(defun f (a) a)"))))
+
+(test result-replay-restores-def-names
+  (multiple-value-bind (v run)
+      (ev "(result :v 2 :n 1 :form (def conclusion (plan_dsl)) :value (a b c))
+           (pure (list conclusion last-result))")
+    (is (equal (rd "((a b c) (a b c))") v))
+    (is (= 0 (calls run)))))
+
+(test result-replay-v1-does-not-restore
+  ;; v1 files recorded the defined name as :value; restoring would silently
+  ;; bind conclusion to the symbol conclusion, so replay must skip it.
+  (multiple-value-bind (v run)
+      (ev "(result :n 1 :form (def conclusion (plan_dsl)) :value conclusion)
+           (pure conclusion)")
+    (is (consp v))
+    (is (eq (rd "error") (first v)))
+    (is (= 0 (calls run)))))
+
+(test result-replay-skips-host-placeholders
+  (multiple-value-bind (v run)
+      (ev "(result :v 2 :n 1 :form (def g (lambda (x) x)) :value (closure anonymous))
+           (pure g)")
+    (is (consp v))
+    (is (eq (rd "error") (first v)))
+    (is (= 0 (calls run)))))
+
+(test result-file-chains-def-values
+  ;; End to end: run a file that defs a value, @use its result file from a
+  ;; fresh environment, and read the value back by name with no oracle calls.
+  (let* ((root (fresh-root))
+         (src (merge-pathnames "up.lisp" root)))
+    (with-open-file (out src :direction :output :if-exists :supersede)
+      (write-string "(def conclusion '(gap work money)) (+ 1 2)" out))
+    (is (= 0 (allisp::run-file
+              src :backend (make-instance 'allisp::mock-backend :responses '()))))
+    (multiple-value-bind (v run)
+        (ev (format nil "(@use \"~a\") (pure (list conclusion last-result))"
+                    (namestring (merge-pathnames "output/up.result.lisp" root)))
+            :run (make-test-run :root root))
+      (is (equal (rd "((gap work money) 3)") v))
+      (is (= 0 (calls run))))))
+
+(test generate-file-writes-raw-text-for-non-lisp-target
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "gen.lisp" root)))
+         (target (merge-pathnames "out/run.py" root))
+         (run (make-test-run :root root)))
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (is (string= "print(40 + 2)"
+                   (allisp::eval-toplevel-form
+                    (rd "(generate-file \"out/run.py\" \"print(40 + 2)\")") env))))
+    (is (probe-file target))
+    (is (string= (format nil "print(40 + 2)~%")
+                 (uiop:read-file-string target)))))
+
+(test generate-file-rejects-non-string-for-non-lisp-target
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "gen.lisp" root)))
+         (run (make-test-run :root root)))
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (let ((value (allisp::eval-toplevel-form
+                    (rd "(generate-file \"out/run.py\" '(+ 20 22))") env)))
+        (is (eq (rd "error") (first value)))
+        (is (eq (getf (rest value) :type) :generated-text-not-string))))
+    (is (not (probe-file (merge-pathnames "out/run.py" root))))))
+
+(test generate-file-hints-oracle-to-return-string-for-non-lisp-target
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "gen.lisp" root)))
+         (run (make-test-run :root root :responses '("\"print(1)\""))))
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (allisp::eval-toplevel-form
+       (rd "(generate-file \"out/run.py\" (synthesize-script))") env))
+    (is (= 1 (calls run)))
+    (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
+      (is (search "double-quoted Lisp string" prompt)))
+    (is (string= (format nil "print(1)~%")
+                 (uiop:read-file-string (merge-pathnames "out/run.py" root))))))
+
+(test lisp-target-prompt-has-no-string-hint
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "gen.lisp" root)))
+         (run (make-test-run :root root :responses '("(defun f (x) x)"))))
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (allisp::eval-toplevel-form
+       (rd "(generate-file \"out/lib.lisp\" (synthesize-lib))") env))
+    (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
+      (is (not (search "double-quoted Lisp string" prompt))))))
+
+(test oracle-string-response-with-parens-parses-whole
+  ;; A string-literal response containing parens must not be truncated by the
+  ;; skip-leading-prose heuristic.
+  (multiple-value-bind (v run)
+      (ev "(mystery 1)" :responses '("\"print(40 + 2)\""))
+    (is (string= "print(40 + 2)" v))
+    (is (= 1 (calls run)))))
+
+(test oracle-string-response-unescapes-c-style
+  (multiple-value-bind (v run)
+      (ev "(mystery 1)" :responses '("\"line1\\nline2 \\\"quoted\\\" tab\\there\""))
+    (declare (ignore run))
+    (is (string= (format nil "line1~%line2 \"quoted\" tab~ahere" #\Tab) v))))

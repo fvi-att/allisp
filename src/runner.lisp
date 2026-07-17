@@ -38,7 +38,9 @@ use FILE's directory."
                                      :external-format :utf-8)
       (write-header out "result" source)
       (dolist (r results)
-        (write-string (print-sexp (externalize (cons (usym "RESULT") r))) out)
+        (write-string (print-sexp (externalize
+                                   (list* (usym "RESULT") :v +result-format-version+ r)))
+                      out)
         (format out "~%~%")))
     (with-open-file (out trace-path :direction :output :if-exists :supersede
                                     :external-format :utf-8)
@@ -48,14 +50,15 @@ use FILE's directory."
         (format out "~%~%")))
     (values result-path trace-path)))
 
-(defun run-file (path &key refresh strict dry-run model backend plugins)
+(defun run-file (path &key refresh strict dry-run model backend plugins (agentic t))
   "Evaluate PATH as an allisp file. Writes result/trace next to it under
 output/. Returns the exit code (0 = no errors)."
   (let* ((source (truename path))
          (root (find-project-root source))
          (*run* (make-run :source source :root root
                           :model (or model "sonnet")
-                          :backend (or backend (make-instance 'claude-cli-backend))
+                          :backend (or backend (make-instance 'claude-cli-backend
+                                                              :agentic agentic))
                           :refresh refresh :strict strict :dry-run dry-run))
          (*current-file* source)
          (_ (load-plugins plugins root))
@@ -88,13 +91,14 @@ output/. Returns the exit code (0 = no errors)."
               (namestring result-path) (namestring trace-path) aborted))
     (if (or aborted (run-errors *run*)) 1 0)))
 
-(defun run-one-liner (source-text &key refresh strict dry-run model backend root plugins)
+(defun run-one-liner (source-text &key refresh strict dry-run model backend root plugins (agentic t))
   "Evaluate the allisp forms in SOURCE-TEXT and print the final value.
 Returns the exit code (0 = no errors). No result or trace files are written."
   (let* ((root (or root (find-project-root (uiop:getcwd))))
          (*run* (make-run :source nil :root root
                           :model (or model "sonnet")
-                          :backend (or backend (make-instance 'claude-cli-backend))
+                          :backend (or backend (make-instance 'claude-cli-backend
+                                                              :agentic agentic))
                           :refresh refresh :strict strict :dry-run dry-run))
          (*current-file* nil)
          (_ (load-plugins plugins root))

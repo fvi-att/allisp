@@ -20,6 +20,12 @@
 (defparameter +missing+ '#:missing
   "Sentinel distinguishing an absent keyword argument from an explicit NIL.")
 
+(defvar *oracle-string-hint* nil
+  "When true, oracle prompts ask for the value as one Lisp string literal.
+Bound by generate-file around the body evaluation for non-.lisp targets,
+where the value is written verbatim into a script or document. The extra
+rule changes the prompt, so these calls get their own cache entries.")
+
 ;; ---------------------------------------------------------------- entry
 
 (defun a-eval (form env &optional effect)
@@ -221,7 +227,7 @@ Returns the value or +MISSING+."
     "LET" "LET*" "LAMBDA" "PROGN" "AND" "OR"
     "DEFUN" "DEFINE" "DEFMACRO" "DEF" "DEFVAR" "DEFPARAMETER"
     "SETQ" "SETF" "PUSH" "INCF" "DECF"
-    "@USE" "LLM" "PURE" "DEFER" "DEPRECATE"
+    "@USE" "LLM" "PURE" "DEFER" "DEPRECATE" "RESULT"
     "%GENERATE-FILE" "%GOAL" "%SOLVE" "%CONSTRAINT"))
 
 (defparameter +special-forms+
@@ -290,9 +296,9 @@ Returns the value or +MISSING+."
                            (make-closure :name fname :params params
                                          :body (cdr rest) :env env :source form))
                fname)
-             (progn (env-define env (first rest)
-                                (when (cdr rest) (a-eval (second rest) env)))
-                    (first rest))))
+             (let ((val (when (cdr rest) (a-eval (second rest) env))))
+               (env-define env (first rest) val)
+               val)))
         ((is "DEFMACRO")
          (destructuring-bind (mname params &rest body) rest
            (env-define env mname
@@ -302,12 +308,14 @@ Returns the value or +MISSING+."
         ((or (is "DEF") (is "DEFVAR") (is "DEFPARAMETER"))
          ;; (def name expr) evaluates; (def name f1 f2 ...) stores the forms
          ;; as data so prose-like constant tables do not become programs.
-         (let ((var (first rest)))
-           (env-define env var
-                       (cond ((null (cdr rest)) nil)
-                             ((null (cddr rest)) (a-eval (second rest) env))
-                             (t (cdr rest))))
-           var))
+         ;; Returns the bound value (not the name) so result files record it
+         ;; and (result ...) replay can restore the binding by name.
+         (let ((var (first rest))
+               (val (cond ((null (cdr rest)) nil)
+                          ((null (cddr rest)) (a-eval (second rest) env))
+                          (t (cdr rest)))))
+           (env-define env var val)
+           val))
         ((is "SETQ")
          (loop for (var val) on rest by #'cddr
                for v = (a-eval val env)
@@ -339,6 +347,7 @@ Returns the value or +MISSING+."
                    v)
                  (unbound form env effect)))))
         ((is "@USE") (eval-use form env))
+        ((is "RESULT") (eval-result form env))
         ((is "LLM") (eval-llm form env))
         ((is "DEFER")
          ;; Preserve the decision's code verbatim.  The remaining arguments
@@ -608,6 +617,19 @@ make the branch fail."
               (print-sexp (externalize value))))
     target))
 
+(defun write-generated-text (target text)
+  "Write TEXT verbatim (plus a final newline when missing) for non-.lisp
+targets such as scripts. No header is embedded: comment syntax varies by
+format (JSON has none), so provenance lives in the trace instead."
+  (ensure-directories-exist target)
+  (with-open-file (out target :direction :output :if-exists :supersede
+                              :external-format :utf-8)
+    (write-string text out)
+    (let ((len (length text)))
+      (unless (and (plusp len) (char= (char text (1- len)) #\Newline))
+        (terpri out))))
+  target)
+
 (defun eval-generate-file (form env)
   (destructuring-bind (operator path-form value-form &optional origin-form) form
     (declare (ignore operator))
@@ -616,7 +638,11 @@ make the branch fail."
         (return-from eval-generate-file
           (make-error-value :invalid-generated-path form
                             "generate-file path must evaluate to a string")))
-      (let ((value (a-eval value-form env)))
+      (let* ((lisp-target (string-equal (pathname-type path) "lisp"))
+             ;; Non-.lisp targets need a raw string; steer oracle calls made
+             ;; while evaluating the body toward returning one.
+             (value (let ((*oracle-string-hint* (not lisp-target)))
+                      (a-eval value-form env))))
         (when (and (consp value) (eq (first value) (usym "ERROR")))
           (return-from eval-generate-file value))
         (let ((target (generated-path path))
@@ -625,19 +651,30 @@ make the branch fail."
             (return-from eval-generate-file
               (make-error-value :generated-path-is-source form
                                 "generate-file cannot overwrite its source file")))
-          (if (and *run* (run-dry-run *run*))
-              (format *error-output* "~&[allisp]   would generate ~a~%"
-                      (namestring target))
-              (handler-case
-                  (progn
-                    (write-generated-source target value origin)
-                    (format *error-output* "~&[allisp]   generated ~a~%"
-                            (namestring target)))
-                (error (e)
-                  (return-from eval-generate-file
-                    (make-error-value :generate-file-error form
-                                      (princ-to-string e))))))
-          value)))))
+          (progn
+            (if (and *run* (run-dry-run *run*))
+                (format *error-output* "~&[allisp]   would generate ~a~%"
+                        (namestring target))
+                (progn
+                  ;; Non-.lisp targets (scripts, JSON, ...) take a raw string;
+                  ;; refuse anything else so an S-expression never lands in a
+                  ;; file another tool will execute or parse.
+                  (unless (or lisp-target (stringp value))
+                    (return-from eval-generate-file
+                      (make-error-value :generated-text-not-string form
+                                        "non-.lisp target requires a string value")))
+                  (handler-case
+                      (progn
+                        (if lisp-target
+                            (write-generated-source target value origin)
+                            (write-generated-text target value))
+                        (format *error-output* "~&[allisp]   generated ~a~%"
+                                (namestring target)))
+                    (error (e)
+                      (return-from eval-generate-file
+                        (make-error-value :generate-file-error form
+                                          (princ-to-string e)))))))
+            value))))))
 
 ;; ---------------------------------------------------------------- @use
 
@@ -658,6 +695,50 @@ make the branch fail."
         (dolist (f (read-allisp-file true))
           (eval-toplevel-form f env))))
     t))
+
+;; ---------------------------------------------------------------- result replay
+
+(defparameter +result-format-version+ 2)
+
+(defun def-form-name (form)
+  "Return the defined name when FORM is a data-definition form whose value a
+result file can restore: def / defvar / defparameter, or the variable form of
+define. Function definitions (defun, defmacro, define with a lambda list) are
+excluded because closures do not survive externalization."
+  (when (and (consp form) (symbolp (first form)) (symbolp (second form)))
+    (let ((head (symbol-name (first form))))
+      (when (or (string= head "DEF") (string= head "DEFVAR")
+                (string= head "DEFPARAMETER") (string= head "DEFINE"))
+        (second form)))))
+
+(defun restorable-value-p (value)
+  "Host objects are written to result files as placeholders such as
+(closure name); those must not be rebound as if they were data."
+  (not (and (consp value)
+            (symbolp (first value))
+            (member (symbol-name (first value))
+                    '("CLOSURE" "MACRO" "BUILTIN" "HASH-TABLE")
+                    :test #'string=))))
+
+(defun eval-result (form env)
+  "Replay a (result :v 2 :n K :form F :value V) record from a .result.lisp
+file. F is never re-evaluated and V is treated as data, so replay performs no
+oracle calls. From format version 2 on, a def-family F re-establishes its
+name -> V binding; last-result always tracks the latest V. Version 1 files
+recorded the defined name as V, so their defs are not restored."
+  (let* ((plist (cdr form))
+         (version (let ((v (safe-getf plist :v)))
+                    (if (eq v +missing+) 1 v)))
+         (source (let ((f (safe-getf plist :form)))
+                   (unless (eq f +missing+) f)))
+         (value (let ((v (safe-getf plist :value)))
+                  (unless (eq v +missing+) v))))
+    (when (and (integerp version) (>= version 2))
+      (let ((name (def-form-name source)))
+        (when (and name (restorable-value-p value))
+          (env-define env name value))))
+    (env-define env (usym "LAST-RESULT") value)
+    value))
 
 (defun eval-toplevel-form (form env)
   (let ((*current-toplevel* form))
@@ -684,7 +765,7 @@ make the branch fail."
 
 ;; ---------------------------------------------------------------- oracle
 
-(defparameter +prompt-version+ "20260715-1")
+(defparameter +prompt-version+ "20260716-1")
 
 (defun form-symbols (form)
   (let ((acc '()))
@@ -721,6 +802,14 @@ source file instead."
                 (mapcar (lambda (p) (truncate-string p 6000))
                         (nreverse parts))))))
 
+(defun agentic-oracle-p ()
+  "True when the oracle subprocess can explore the repository: the backend
+runs with read-only tools enabled and there is a source file to start from.
+The exploration section changes the prompt, so agentic and non-agentic calls
+get separate cache entries."
+  (and *run* *current-file*
+       (backend-agentic (run-backend *run*))))
+
 (defun build-oracle-prompt (form context)
   (format nil "You are the LLM oracle of allisp, a Lisp dialect for expressing human thinking and reasoning as S-expressions.
 
@@ -731,8 +820,9 @@ Rules:
 2. The value must be plain Lisp data — lists, symbols, keywords, strings, numbers. Mirror the DSL's own shapes: tagged lists like (finding ...) / (conclusion ...) or plists (:key value ...).
 3. Definitions provided below are normative — honor their docstrings and structure.
 4. Actually perform the analysis or computation the form describes, concretely and specifically for the given data. Never restate the question, never answer generically.
-5. Keep natural-language strings in the language of the source (Japanese stays Japanese, English stays English).
-
+5. The value is the RESULT of executing the form — never a restatement, normalization, or paraphrase of the form itself. If most of the strings in your reply already appear in the input, you have not executed it. Include what execution produced that the form does not literally contain: evidence, derived judgments, concrete conclusions.
+6. Keep natural-language strings in the language of the source (Japanese stays Japanese, English stays English).
+~@[~a~]~@[~a~]
 === Relevant definitions and bindings ===
 ~a
 
@@ -741,6 +831,16 @@ Rules:
 
 === Pseudo-execute this form and return its value ===
 ~a~%"
+          (when *oracle-string-hint*
+            (format nil "7. The caller writes your value verbatim into a non-Lisp file (a script or document). Return it as EXACTLY ONE double-quoted Lisp string containing the complete text, with internal double quotes escaped as \\\".~%"))
+          (when (agentic-oracle-p)
+            (format nil "
+=== Environment ===
+source file: ~a
+project root: ~a
+You can read this repository with the Read, Glob, and Grep tools. Before answering, gather context: read the source file around the form, follow file paths the form mentions (basis / @use / relative paths), and consult neighboring files that bear on it. Then pseudo-execute the form against what you actually found. Your final reply must still be exactly one S-expression.~%"
+                    (namestring *current-file*)
+                    (namestring (run-root *run*))))
           (if (string= context "") "(none)" context)
           (truncate-string (print-sexp *current-toplevel*) 12000)
           (print-sexp form)))
@@ -756,19 +856,46 @@ Rules:
               s))
         s)))
 
+(defun parse-string-response (s)
+  "Read a double-quoted string with C-style escapes (\\n \\t \\r \\\" \\\\).
+LLMs emit those far more often than CL's escape-next-char-literally rule, so
+string responses get their own parser. Returns (values string ok-p)."
+  (let ((out (make-string-output-stream))
+        (i 1)
+        (len (length s)))
+    (loop
+      (when (>= i len) (return (values nil nil)))   ; unterminated
+      (let ((c (char s i)))
+        (cond ((char= c #\")
+               (return (values (get-output-stream-string out) t)))
+              ((and (char= c #\\) (< (1+ i) len))
+               (let ((next (char s (1+ i))))
+                 (write-char (case next
+                               (#\n #\Newline)
+                               (#\t #\Tab)
+                               (#\r #\Return)
+                               (t next))
+                             out))
+               (incf i 2))
+              (t (write-char c out)
+                 (incf i)))))))
+
 (defun parse-oracle-response (text)
   "Extract one S-expression from TEXT. Returns (values form ok-p)."
-  (let* ((s (strip-code-fences text))
-         (paren (position #\( s))
-         (candidate (if (and paren
-                             ;; leading prose before the sexp — skip to it
-                             (string/= "" (string-trim
-                                           '(#\Space #\Newline #\Tab #\Return)
-                                           (subseq s 0 paren))))
-                        (subseq s paren)
-                        s)))
-    (handler-case (values (read-allisp-string candidate) t)
-      (error () (values nil nil)))))
+  (let ((s (strip-code-fences text)))
+    (if (and (plusp (length s)) (char= (char s 0) #\"))
+        ;; A string literal may contain parens; parse it whole, C escapes and all.
+        (parse-string-response s)
+        (let* ((paren (position #\( s))
+               (candidate (if (and paren
+                                   ;; leading prose before the sexp — skip to it
+                                   (string/= "" (string-trim
+                                                 '(#\Space #\Newline #\Tab #\Return)
+                                                 (subseq s 0 paren))))
+                              (subseq s paren)
+                              s)))
+          (handler-case (values (read-allisp-string candidate) t)
+            (error () (values nil nil)))))))
 
 (defun oracle-eval (form env &key model fresh context-mode)
   (unless *run*
@@ -806,7 +933,8 @@ Rules:
                                (format nil "~%REMINDER: your previous reply could not be parsed. Reply with exactly ONE S-expression and nothing else.~%"))
           do (multiple-value-bind (raw call-ok)
                  (handler-case (values (backend-complete (run-backend *run*) p
-                                                         :model model)
+                                                         :model model
+                                                         :directory root)
                                        t)
                    (error (e) (values (princ-to-string e) nil)))
                (when call-ok

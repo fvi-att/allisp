@@ -30,6 +30,7 @@ PATH になければ、allisp リポジトリ内の `bin/allisp` を使う。
 | 「考え直して」「再思考」「キャッシュ無視で」 | `allisp run <file> --refresh` |
 | 「厳格に」「エラーで止めて」 | `allisp run <file> --strict` |
 | 「opus で」「もっと深く考えさせて」 | `allisp run <file> --model opus` |
+| 「リポジトリを読ませずに」「探索なしで」 | `allisp run <file> --no-explore` |
 | 「この S 式を直接評価」 | `allisp --one-liner "<form>"` |
 | 特定の式だけ再思考したい | ソースのその式を `(llm <式> :fresh t)` で包むことを提案 |
 
@@ -53,7 +54,7 @@ PATH になければ、allisp リポジトリ内の `bin/allisp` を使う。
 
 出力は入力ファイルの隣の `output/` に生成される:
 
-- `<name>.result.lisp` — 各トップレベル式の `(result :n K :form <元の式> :value <評価値>)`
+- `<name>.result.lisp` — 各トップレベル式の `(result :v 2 :n K :form <元の式> :value <評価値>)`
 - `<name>.trace.lisp` — 全オラクル呼び出しの記録(hash / model / hit・miss / 値)
 
 報告時は result.lisp を読み、次を要約する:
@@ -68,9 +69,14 @@ PATH になければ、allisp リポジトリ内の `bin/allisp` を使う。
 ## 4. 知っておくべきセマンティクス(要約)
 
 - 再実行はキャッシュにより決定論的リプレイ(全 hit なら 1 秒未満)。編集した式だけが再問い合わせになる
+- ファイル実行のオラクルは読み取り専用ツール(Read/Glob/Grep)でリポジトリを探索してから擬似実行する。
+  周辺ファイルが変わっても**キャッシュ済みの結果は変わらない** — 再思考させたいときは `--refresh` を使う
 - キャッシュはプロジェクトルートの `.allisp/oracle/` に蓄積される
-- `(@use "相対パス")` で他ファイルの定義を継承する
+- `(@use "相対パス")` で他ファイルの定義を継承する。
+  `output/*.result.lisp` も `@use` でき、上流で `(def NAME ...)` した値が LLM 呼び出しなしで復元される(chain)。
+  直近の結果値は `last-result` で参照できる
 - `(generate-file "path.lisp" body...)` は最終評価値を別ファイルへ書き出し、
-  `generated-by` マーカーで生成元を記録する。`--dry-run` 時は書き出さない
+  `generated-by` マーカーで生成元を記録する。`--dry-run` 時は書き出さない。
+  書き出し先が `.lisp` 以外なら値は文字列に限り、生テキスト(Python/markdown 等)としてそのまま書く
 - `--one-liner` は最後の評価値を標準出力へ表示し、result / trace ファイルは生成しない
 - 詳細仕様: リポジトリ内の `docs/language.md`、設計判断: `DESIGN.md`

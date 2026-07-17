@@ -29,6 +29,18 @@
 ファイル全体を渡すと、関係のない変更でもキャッシュキーが変わり、コストも増えるためである。
 `(llm <form> :context :file)` を指定すると、明示的にファイル全体を渡せる。
 
+## オラクルの探索（agentic oracle）
+
+ファイル実行では、オラクルのサブプロセスに読み取り専用ツール（Read / Glob / Grep）を許可し、プロジェクトルートを作業ディレクトリとして起動する。
+プロンプトにはソースファイルのパスとプロジェクトルートを記した Environment 節が入り、オラクルは回答前に、フォームが参照するファイル（`basis` や `@use` の相対パスなど）や周辺ファイルを自分で読んで文脈を集める。
+これは、依存解析で同梱できるのが環境内の束縛だけであり、思考 DSL がファイルパスで指す外部文脈には届かないことを補うためである。
+
+- `--no-explore` を指定すると探索を止め、従来どおり同梱文脈のみで擬似実行する。
+  探索の有無でプロンプトが変わるため、キャッシュキーは自動的に分かれる。
+- fresh なオラクル呼び出しは「呼び出し時点のリポジトリ状態」を反映する。
+  キャッシュからのリプレイは従来どおり完全に決定論的であり、周辺ファイルが変わっても結果は変わらない。再思考させたいときは `--refresh` か `(llm :fresh t)` を使う。
+- one-liner 実行には起点となるソースファイルがないため、Environment 節は付かない。
+
 ## 明示的に実行経路を選ぶフォーム
 
 通常の実行境界では不足する場合は、次のフォームで経路を指定する。
@@ -43,6 +55,32 @@
 
 (@use "path.lisp")    ; 呼び出し元からの相対パスを評価し、すべての定義を継承する（冪等）
 ```
+
+## 結果ファイルの再利用（chain）
+
+実行が生成する `output/foo.result.lisp` は、そのまま `@use` の対象にできる。
+result ファイルの各フォーム `(result :v 2 :n K :form F :value V)` は組み込みの `result` フォームとして評価され、`:form` を再評価せず、`:value` を未評価のデータとして扱う。
+したがって **リプレイはオラクルを一度も呼ばない**。
+
+```lisp
+;; 上流 plan.lisp — 公開したい値に def で名前を付ける
+(def CONCLUSION (plan_dsl ...))
+
+;; 下流 — result ファイルを読み込むと、名前がそのまま復元される
+(@use "./output/plan.result.lisp")
+(to-markdown CONCLUSION)
+```
+
+- `:form` が `def`（`defvar` / `defparameter` / `define` の変数形を含む）のとき、その名前を `:value` で再束縛する。
+  このために `def` は束縛した値を返す（[方言](#方言)参照）。
+- `defun` / `defmacro` は復元しない。クロージャはファイルに保存できず、
+  `:value` には `(closure name)` のようなプレースホルダしか残らないためである。
+  関数も含めて継承したい場合は、result ファイルではなく元のソースを `@use` する。
+- 名前のない式の値には、直近の result の値を指す `last-result` でアクセスできる。
+- `:v` キーは result 形式のバージョンである。`:v` を持たない旧形式（v1）は
+  `def` の値を記録していないため、名前の復元は行わない。
+  元ソースを再実行（全キャッシュヒット）すれば新形式で再生成される。
+- この仕様により `result` は予約語になった。ユーザー DSL の演算子名には使えない。
 
 ## 評価結果をファイルに書き出すマクロ
 
@@ -60,6 +98,19 @@
 - 評価値がエラー値の場合は書き出さない。
 - 複数のトップレベルフォームを生成する場合は、値を `(progn <form>...)` にする。
 - `--dry-run` を指定した場合はファイルを作成しない。
+- **書き出し先が `.lisp` 以外の場合、値は文字列でなければならず、生テキストとしてそのまま書き出す**（末尾に改行がなければ補う）。
+  Python やシェルスクリプトなど S 式でないコードへ落とし込む chain の終端に使う。
+  コメント構文が形式ごとに異なる（JSON にはない）ため生成履歴ヘッダは埋め込まず、生成の記録は trace に残る。
+  文字列以外の値は `:generated-text-not-string` のエラー値になる。
+  `.lisp` 以外への書き出しでは、`<body>` 評価中のオラクル呼び出しに「値を一つの Lisp 文字列で返す」ルールが自動で加わる
+  （プロンプトが変わるため、該当呼び出しは通常評価とは別のキャッシュエントリになる）。
+
+```lisp
+;; 抽象 DSL の結論を Python スクリプトに落とし込む
+(@use "./output/plan.result.lisp")
+(generate-file "generated/review.py"
+  (lower-to-python CONCLUSION))   ; 未定義 → LLM が Python コードの文字列を返す
+```
 
 生成ファイルの先頭には、次の情報を自動で挿入する。
 
@@ -138,11 +189,14 @@
 - quote、backquote、comma は独自の reader macro により、`(quote ...)`、`(quasiquote ...)`、`(unquote ...)`、`(unquote-splicing ...)` の平リストとして読まれる。
 - `(def name expr)` は `expr` を評価して束縛する。
   `(def name f1 f2 ...)` はフォーム列を未評価のデータとして束縛するため、散文的な定数表にも使える。
+  `def` 系の評価値は**束縛した値**である（CL と異なり名前ではない）。
+  result ファイルに値が記録され、chain で復元できるようにするためである。
+  `defun` / `defmacro` は従来どおり名前を返す。
 - マクロの `&key` は、引数が奇数個の場合やキーワード以外が混ざる場合もエラーにしない。
   思考用 DSL の自由な記法を許容するためである。
 - `t` と `nil` 以外の CL シンボルは見えない。
   許可リストにない名前は、確実にオラクルへ渡る。
-- **特殊形式**：`quote`、`quasiquote`、`if`、`cond`、`when`、`unless`、`let`、`let*`、`lambda`、`progn`、`and`、`or`、`defun`、`define`、`defmacro`、`def`、`defvar`、`defparameter`、`setq`、`setf`、`push`、`incf`、`decf`、`@use`、`llm`、`pure`、`defer`、`deprecate`
+- **特殊形式**：`quote`、`quasiquote`、`if`、`cond`、`when`、`unless`、`let`、`let*`、`lambda`、`progn`、`and`、`or`、`defun`、`define`、`defmacro`、`def`、`defvar`、`defparameter`、`setq`、`setf`、`push`、`incf`、`decf`、`@use`、`llm`、`pure`、`defer`、`deprecate`、`result`
 
 ### 保留・非推奨の判断
 

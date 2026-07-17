@@ -1,7 +1,8 @@
 # Allisp
 
-定義済みのフォームは決定論的に評価する。
-定義のないフォームは、LLM オラクルが擬似実行する Lisp 処理系である。
+Defined forms evaluate deterministically.
+Undefined forms go to an LLM oracle that **pseudo-executes** them.
+Allisp is a Lisp interpreter built on this boundary.
 
 ```lisp
 (defun average (numbers)
@@ -11,112 +12,191 @@
 
 (def samples '(12 18 15))
 
-(average samples)                                ; 定義済み → 15
+(average samples)                                ; defined → 15
 
-(summarize-metrics :samples samples)             ; 未定義 → LLM が S 式を返す
+(summarize-metrics :samples samples)             ; undefined → the oracle returns an S-expression
 ```
 
-`defmacro` と `defun` を増やすほど、評価できる範囲は決定論的になる。
-未定義の思考は LLM が補う。
-オラクルの結果は永続キャッシュするため、同じ入力を再実行すると決定論的にリプレイできる。
+The more `defun` and `defmacro` definitions you add, the more of the program evaluates deterministically.
+The LLM fills in the thinking you left undefined.
+Oracle results land in a persistent cache, so rerunning the same input replays deterministically without calling the LLM.
 
-## 公開・利用について
+## Judgments no CPU could compute
 
-このリポジトリには個人用の設定、IDE 設定、オラクルキャッシュ、実行結果を含めない。
-これらは `.gitignore` の対象であり、生成物には入力内容やローカルパスが含まれる場合があるため、公開前に内容を確認すること。
-ライセンスは [GNU General Public License v3.0](LICENSE)（GPL-3.0-only）である。
+Until now, a program could only contain functions a CPU can compute.
+Judgments like "how risky is this release?" or "can this team operate a message queue?" have no deterministic definition, so they lived outside the program, in documents and meetings.
 
-- 言語仕様（実行境界、`llm`、`pure`、`@use`、エラー値、キャッシュ）：[docs/language.md](docs/language.md)
-- 開発ガイド（テスト、ソース構成、バックエンドの差し替え）：[docs/development.md](docs/development.md)
-- 設計決定の経緯：[DESIGN.md](DESIGN.md)
-- 決定論、LLM、マクロを混在させる実行例：[sample/README.md](sample/README.md)
+In allisp, an undefined form is not an error: the whole form goes to the LLM for pseudo-execution.
+Write a judgment or an estimate as an undefined function application and it becomes an expression.
 
-## 実行方法
+```lisp
+(classify-release-risk
+  :context release-context
+  :return-shape '(:risk-level symbol :reasons (string)))
+```
 
-リポジトリ内のサンプルは、外部の allisp ソースに依存しない。
-次の dry-run は LLM を呼び出さずに実行できる。
+The oracle returns a value as an S-expression rather than prose.
+The value is data inside the language, so you can pass it straight to deterministic post-processing such as `get-property` or `filter`.
+One file holds the whole division of labor: the LLM makes the judgment, and your code constrains how the judgment is consumed.
+
+During file execution, the oracle explores the repository with read-only tools and reads the files a form refers to before pseudo-executing it (disable with `--no-explore`).
+
+## An ADR you can run
+
+An **ADR** (architecture decision record) stops the moment you write it.
+When premises change, the document stays behind, and a person has to reread it to check whether the decision still holds.
+
+In allisp, you write premises as `def` bindings and the decision as an oracle form.
+The record itself executes, so a rerun is an audit.
+The result and trace record, as S-expressions, which premises led to which judgments.
+
+The oracle cache key includes the bindings a form references.
+Rewrite one premise, and only the expressions that depend on it are re-thought; the rest replay from cache.
+
+[sample/09-executable-adr.lisp](sample/09-executable-adr.lisp) is a minimal ADR with three premises and two judgments.
+Rewrite only the budget premise and rerun: the budget-dependent decision goes back to the oracle, while the revisit triggers, which read only the team premise, come back from cache.
+
+```sh
+bin/allisp run sample/09-executable-adr.lisp   # first run: oracle 2 calls (2 misses)
+bin/allisp run sample/09-executable-adr.lisp   # rerun: 2 hits, no LLM call
+# rewrite budget-premise and rerun: 1 miss / 1 hit
+```
+
+## Compared with prompts in Markdown
+
+Many teams keep LLM instructions in Markdown documents and paste them into a chat whenever needed.
+That workflow keeps no record of execution.
+Each rerun bills you again, answers a bit differently, and leaves no way to match an instruction version to the answer it produced.
+
+In allisp, an LLM call is an expression in the language, and each run leaves two records.
+
+- **trace**: a record of every oracle call, including hash, model, cache hit or miss, and the returned value.
+- **oracle cache**: persisted under `.allisp/oracle/`, keyed by the sha256 of the prompt version, the model, and the full prompt text.
+
+Rerunning the same input calls no API and returns identical values.
+Cost and variance disappear exactly as far as this replay reaches.
+When you want fresh thinking, break the cache with `--refresh` or `(llm :fresh t)`.
+Keep the cache in Git, and you version the model's answers themselves.
+
+## Publishing and use
+
+This repository excludes personal settings, IDE settings, oracle caches, and execution results.
+`.gitignore` covers them; generated files can contain your inputs and local paths, so review them before publishing.
+The license is the [GNU General Public License v3.0](LICENSE) (GPL-3.0-only).
+
+- Language spec (execution boundary, `llm`, `pure`, `@use`, error values, cache): [docs/language.md](docs/language.md) (Japanese)
+- Development guide (tests, source layout, swapping backends): [docs/development.md](docs/development.md) (Japanese)
+- Design decision history: [DESIGN.md](DESIGN.md) (Japanese)
+- Samples mixing determinism, LLM calls, and macros: [sample/README.md](sample/README.md)
+
+## Usage
+
+The samples in this repository depend on no external allisp sources.
+The following dry-run executes without calling the LLM.
 
 ```sh
 bin/allisp run sample/01-deterministic.lisp --dry-run
 ```
 
 ```sh
-allisp run <file.lisp>               # 実行
-allisp run <file.lisp> --dry-run     # LLM を呼ばず、オラクルに渡る箇所を表示
-allisp run <file.lisp> --refresh     # キャッシュを無視して全オラクルを再実行
-allisp run <file.lisp> --strict      # 最初のエラーで停止（既定ではエラー値化して継続）
-allisp run <file.lisp> --model opus  # 既定のモデルを変更（sonnet | opus | haiku）
-allisp --one-liner "(+ 1 2)"         # 文字列内の S 式を評価し、最後の値を表示
+allisp run <file.lisp>               # run a file
+allisp run <file.lisp> --dry-run     # show what would reach the oracle, without calling the LLM
+allisp run <file.lisp> --refresh     # ignore the cache and re-run every oracle call
+allisp run <file.lisp> --strict      # stop at the first error (default: errors become values, execution continues)
+allisp run <file.lisp> --model opus  # change the default model (sonnet | opus | haiku)
+allisp run <file.lisp> --no-explore  # disable the oracle's repository exploration (Read/Glob/Grep)
+allisp --one-liner "(+ 1 2)"         # evaluate the forms in the string and print the last value
 allisp run thought.lisp --plugin 'https://example.com/review-syntax.git#<commit-sha>'
 ```
 
-`--one-liner` には複数のフォームを渡せる。
-各フォームを順に評価し、最後の値だけを標準出力へ S 式で表示する。
-ファイルは生成せず、LLM キャッシュにはカレントプロジェクトの `.allisp/oracle/` を使う。
-`--dry-run`、`--refresh`、`--strict`、`--model` も併用できる。
+`--one-liner` accepts multiple forms.
+It evaluates them in order and prints only the last value to stdout as an S-expression.
+It writes no files and uses the current project's `.allisp/oracle/` as the LLM cache.
+`--dry-run`, `--refresh`, `--strict`, and `--model` combine with it.
 
-## 評価結果のコード生成
+## Chaining results
 
-**`generate-file` マクロ**は、body の最終評価値を一つのトップレベル S 式として別ファイルへ書き出す。
+A result file can feed the next run through `@use`.
+Names bound with `def` upstream are restored just by loading the result file (no LLM call).
+
+```lisp
+;; upstream plan.lisp
+(def CONCLUSION (plan_dsl ...))
+
+;; downstream — lower the abstract DSL conclusion to Python
+(@use "./output/plan.result.lisp")
+(generate-file "generated/review.py"
+  (lower-to-python CONCLUSION))   ; the string the LLM returns is written out as raw Python
+```
+
+When the target is not a `.lisp` file, `generate-file` writes the string value as raw text.
+`last-result` refers to the most recent result value.
+See "result chaining" in the [language spec](docs/language.md) for details.
+
+## Generating code from evaluated values
+
+The **`generate-file` macro** writes the final value of its body to another file as one toplevel S-expression.
 
 ```lisp
 (generate-file "generated/add-two.lisp"
-  (synthesize-adder :increment 2))  ; 未定義のため LLM が defun を返す
+  (synthesize-adder :increment 2))  ; undefined, so the LLM returns a defun
 ```
 
-出力先の相対パスは、呼び出し元ファイルを基準に解決する。
-LLM が `(defun add-two (x) (+ x 2))` を返すと、`generated/add-two.lisp` には次の三つのフォームを書き出す。
+Relative output paths resolve against the calling file.
+When the LLM returns `(defun add-two (x) (+ x 2))`, `generated/add-two.lisp` receives three forms:
 
-1. `generated-by` マクロの定義
-2. 生成元、元フォーム、生成時刻を記録する `generated-by` 呼び出し
+1. the definition of the `generated-by` macro
+2. a `generated-by` call recording the source, the original form, and the generation time
 3. `(defun add-two (x) (+ x 2))`
 
-生成ファイルを評価すると、生成情報は `*generated-by*` に plist として束縛される。
-`--dry-run` は評価境界と出力予定パスだけを表示し、ファイルを作成しない。
+Evaluating the generated file binds the generation record to `*generated-by*` as a plist.
+`--dry-run` prints the evaluation boundary and the planned output path, and creates no file.
 
-**入力**：allisp 形式の `.lisp` ファイル一つ。
-トップレベルの各 S 式を先頭から順に評価する。
-`(@use "相対パス")` で他ファイルの定義を継承できる。
+## Input and output
 
-**出力**：入力ファイルと同じディレクトリの `output/` に二つのファイルを生成する。
+**Input**: one `.lisp` file in allisp form.
+Each toplevel S-expression evaluates in order from the top.
+`(@use "relative/path")` inherits the definitions of another file.
+
+**Output**: two files under `output/` next to the input file.
 
 ```
 your_folder/
-├── bar.lisp                  # 入力
+├── bar.lisp                  # input
 └── output/
-    ├── bar.result.lisp       # 全トップレベル式の評価結果（result :n K :form … :value …）
-    └── bar.trace.lisp        # 全オラクル呼び出しの記録（hash / model / hit または miss / 値）
+    ├── bar.result.lisp       # evaluated results of all toplevel forms (result :n K :form … :value …)
+    └── bar.trace.lisp        # record of all oracle calls (hash / model / hit or miss / value)
 ```
 
-プロジェクトルートの `.allisp/oracle/` には、オラクルキャッシュが蓄積される。
-このキャッシュによって、再実行を決定論的にリプレイできる。
-詳細は [言語仕様](docs/language.md) を参照。
-ルートは入力ファイルから上方向に `.allisp/` または `.git/` を探して決める。
-どちらもなければ、入力ファイルのディレクトリを使う。
+The oracle cache accumulates under `.allisp/oracle/` at the project root.
+This cache is what makes reruns replay deterministically.
+See the [language spec](docs/language.md) for details.
+The root is the nearest directory above the input file containing `.allisp/` or `.git/`.
+If neither exists, the input file's directory is used.
 
-**終了コード**：`0` はエラーなし、`1` はエラー値または `--strict` による停止、`2` は使い方の誤り、`3` は内部エラーを表す。
+**Exit codes**: `0` no errors, `1` an error value or a `--strict` stop, `2` usage error, `3` internal error.
 
-## ビルド
+## Build
 
-必要な環境は次のとおり。
+You need the following environment.
 
-- [Roswell](https://github.com/roswell/roswell)（SBCL の管理用）。
-  `brew install roswell` で導入する。
-- [Claude Code](https://claude.com/claude-code) の CLI（LLM オラクルの呼び出し用）。
-  事前に認証する必要がある。
-- 依存ライブラリ（ironclad、fiveam）。
-  初回実行時に Quicklisp が自動取得する。
+- [Roswell](https://github.com/roswell/roswell) (manages SBCL).
+  Install with `brew install roswell`.
+- The [Claude Code](https://claude.com/claude-code) CLI (drives the LLM oracle).
+  Authenticate it beforehand.
+- Libraries (ironclad, fiveam).
+  Quicklisp fetches them on first run.
 
 ```sh
 cd /path/to/allisp
-make test      # テストスイートを実行
-make install   # ~/.local/bin/allisp に bin/allisp への symlink を作成
-make build     # 依存込みの単一実行ファイル dist/allisp を生成
-make clean     # dist/ を削除
+make test      # run the test suite
+make install   # symlink bin/allisp into ~/.local/bin/allisp
+make build     # build dist/allisp, a single executable with dependencies included
+make clean     # remove dist/
 ```
 
-- **`bin/allisp`**：Roswell スクリプト。
-  ソースの変更が即座に反映されるため、日常の実行に向く。
-- **`dist/allisp`**：`save-lisp-and-die` イメージ。
-  Roswell と Quicklisp を必要としない自己完結バイナリである。
-  変更後は `make build` で再生成する。
+- **`bin/allisp`**: a Roswell script.
+  Source changes take effect on the next run, so it suits daily use.
+- **`dist/allisp`**: a `save-lisp-and-die` image.
+  A self-contained binary that needs neither Roswell nor Quicklisp.
+  Rebuild with `make build` after changes.
