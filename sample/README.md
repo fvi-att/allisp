@@ -13,6 +13,7 @@ Each file is standalone and demonstrates one evaluation path.
 | `07-solve-constraints.lisp` | `constraint` filters branches after logic variables are bound. |
 | `08-defer-deprecate.lisp` | Preserves a deferred, unevaluated decision and marks an evaluated result as deprecated. |
 | `09-executable-adr.lisp` | An executable ADR: premises are `def` data, decisions are oracle forms. Editing one premise re-runs only the dependent decision. |
+| `10-generate-markdown.lisp` | Renders structured data into a Markdown report and writes it to a plain `.md` file via `generate-file`. No LLM call. |
 
 Inspect the oracle boundary without making an LLM call:
 
@@ -26,6 +27,7 @@ bin/allisp run sample/06-solve-llm-goal.lisp --dry-run
 bin/allisp run sample/07-solve-constraints.lisp --dry-run
 bin/allisp run sample/08-defer-deprecate.lisp --dry-run
 bin/allisp run sample/09-executable-adr.lisp --dry-run
+bin/allisp run sample/10-generate-markdown.lisp --dry-run
 ```
 
 Run a sample with the authenticated `claude` CLI:
@@ -47,6 +49,17 @@ bin/allisp run sample/output/generated-double.lisp
 The generated file contains its own `generated-by` macro and provenance
 marker. Its generated program defines `double` and evaluates `(double 21)` to
 `42`.
+
+Generate a Markdown report (no LLM call, no `.lisp` header):
+
+```sh
+bin/allisp run sample/10-generate-markdown.lisp
+cat sample/output/findings-report.md
+```
+
+A `.md` target is not a `.lisp` target, so `generate-file` requires the body
+to evaluate to a string and writes it verbatim: no `generated-by` marker, no
+S-expression header, since Markdown has no comment syntax to embed one in.
 
 Results and oracle traces are written to `sample/output/`.
 
