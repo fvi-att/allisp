@@ -31,6 +31,7 @@ PATH になければ、allisp リポジトリ内の `bin/allisp` を使う。
 | 「厳格に」「エラーで止めて」 | `allisp run <file> --strict` |
 | 「opus で」「もっと深く考えさせて」 | `allisp run <file> --model opus` |
 | 「リポジトリを読ませずに」「探索なしで」 | `allisp run <file> --no-explore` |
+| 「結果を〜に保存して」「出力先を変えて」 | `allisp run <file> --out-dir <dir>` |
 | 「この S 式を直接評価」 | `allisp --one-liner "<form>"` |
 | 特定の式だけ再思考したい | ソースのその式を `(llm <式> :fresh t)` で包むことを提案 |
 

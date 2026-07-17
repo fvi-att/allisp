@@ -13,6 +13,9 @@ usage:
 
 options:
   --model <m>   default oracle model (sonnet | opus | haiku), default sonnet
+  --out-dir <dir>
+                write result/trace files under <dir> instead of <dir of source>/output/
+                (run mode only)
   --refresh     ignore the oracle cache and re-ask every oracle form
   --strict      stop at the first error instead of embedding error values
   --dry-run     no LLM calls; report which forms would go to the oracle
@@ -22,7 +25,7 @@ options:
 "))
 
 (defun parse-options (args)
-  (let (refresh strict dry-run model plugins no-explore)
+  (let (refresh strict dry-run model plugins no-explore out-dir)
     (loop while args
           for option = (pop args)
           do (cond
@@ -33,25 +36,30 @@ options:
                ((string= option "--model")
                 (unless args (error "--model needs a value"))
                 (setf model (pop args)))
+               ((string= option "--out-dir")
+                (unless args (error "--out-dir needs a directory"))
+                (setf out-dir (pop args)))
                ((string= option "--plugin")
                 (unless args (error "--plugin needs a Git URL"))
                 (push (pop args) plugins))
                (t (error "unknown option: ~a" option))))
-    (values refresh strict dry-run model (nreverse plugins) no-explore)))
+    (values refresh strict dry-run model (nreverse plugins) no-explore out-dir)))
 
 (defun main (argv)
   (handler-case
       (cond
         ((and (string= (or (first argv) "") "run") (second argv))
-         (multiple-value-bind (refresh strict dry-run model plugins no-explore)
+         (multiple-value-bind (refresh strict dry-run model plugins no-explore out-dir)
              (parse-options (cddr argv))
            (uiop:quit (run-file (second argv)
                                 :refresh refresh :strict strict
                                 :dry-run dry-run :model model :plugins plugins
-                                :agentic (not no-explore)))))
+                                :agentic (not no-explore) :out-dir out-dir))))
         ((and (string= (or (first argv) "") "--one-liner") (second argv))
-         (multiple-value-bind (refresh strict dry-run model plugins no-explore)
+         (multiple-value-bind (refresh strict dry-run model plugins no-explore out-dir)
              (parse-options (cddr argv))
+           (when out-dir
+             (error "--out-dir only applies to run mode"))
            (uiop:quit (run-one-liner (second argv)
                                      :refresh refresh :strict strict
                                      :dry-run dry-run :model model :plugins plugins

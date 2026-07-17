@@ -105,6 +105,7 @@ allisp run <file.lisp> --refresh     # ignore the cache and re-run every oracle 
 allisp run <file.lisp> --strict      # stop at the first error (default: errors become values, execution continues)
 allisp run <file.lisp> --model opus  # change the default model (sonnet | opus | haiku)
 allisp run <file.lisp> --no-explore  # disable the oracle's repository exploration (Read/Glob/Grep)
+allisp run <file.lisp> --out-dir results/  # write result/trace files under results/ instead of output/
 allisp --one-liner "(+ 1 2)"         # evaluate the forms in the string and print the last value
 allisp run thought.lisp --plugin 'https://example.com/review-syntax.git#<commit-sha>'
 ```
@@ -158,7 +159,7 @@ Evaluating the generated file binds the generation record to `*generated-by*` as
 Each toplevel S-expression evaluates in order from the top.
 `(@use "relative/path")` inherits the definitions of another file.
 
-**Output**: two files under `output/` next to the input file.
+**Output**: two files under `output/` next to the input file (`--out-dir <dir>` redirects them to `<dir>`).
 
 ```
 your_folder/

@@ -438,6 +438,19 @@ Returns (values last-value run)."
       (is (equal (rd "((gap work money) 3)") v))
       (is (= 0 (calls run))))))
 
+(test run-file-out-dir-redirects-outputs
+  (let* ((root (fresh-root))
+         (src (merge-pathnames "up.lisp" root))
+         (out-dir (merge-pathnames "elsewhere/" root)))
+    (with-open-file (out src :direction :output :if-exists :supersede)
+      (write-string "(+ 1 2)" out))
+    (is (= 0 (allisp::run-file
+              src :backend (make-instance 'allisp::mock-backend :responses '())
+                  :out-dir (namestring out-dir))))
+    (is (probe-file (merge-pathnames "up.result.lisp" out-dir)))
+    (is (probe-file (merge-pathnames "up.trace.lisp" out-dir)))
+    (is (not (probe-file (merge-pathnames "output/up.result.lisp" root))))))
+
 (test generate-file-writes-raw-text-for-non-lisp-target
   (let* ((root (fresh-root))
          (source (make-empty-file (merge-pathnames "gen.lisp" root)))

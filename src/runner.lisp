@@ -15,9 +15,12 @@ use FILE's directory."
             return start
           finally (return start))))
 
-(defun output-paths (source)
-  (let* ((dir (merge-pathnames
-               "output/" (uiop:pathname-directory-pathname source)))
+(defun output-paths (source &optional out-dir)
+  (let* ((dir (if out-dir
+                  (uiop:ensure-absolute-pathname
+                   (uiop:ensure-directory-pathname out-dir) (uiop:getcwd))
+                  (merge-pathnames
+                   "output/" (uiop:pathname-directory-pathname source))))
          (name (pathname-name source)))
     (values (merge-pathnames (concatenate 'string name ".result.lisp") dir)
             (merge-pathnames (concatenate 'string name ".trace.lisp") dir))))
@@ -31,8 +34,8 @@ use FILE's directory."
           (run-n *run*) (run-misses *run*) (run-hits *run*)
           (length (run-errors *run*))))
 
-(defun write-outputs (source results)
-  (multiple-value-bind (result-path trace-path) (output-paths source)
+(defun write-outputs (source results &optional out-dir)
+  (multiple-value-bind (result-path trace-path) (output-paths source out-dir)
     (ensure-directories-exist result-path)
     (with-open-file (out result-path :direction :output :if-exists :supersede
                                      :external-format :utf-8)
@@ -50,9 +53,9 @@ use FILE's directory."
         (format out "~%~%")))
     (values result-path trace-path)))
 
-(defun run-file (path &key refresh strict dry-run model backend plugins (agentic t))
+(defun run-file (path &key refresh strict dry-run model backend plugins (agentic t) out-dir)
   "Evaluate PATH as an allisp file. Writes result/trace next to it under
-output/. Returns the exit code (0 = no errors)."
+output/, or under OUT-DIR when given. Returns the exit code (0 = no errors)."
   (let* ((source (truename path))
          (root (find-project-root source))
          (*run* (make-run :source source :root root
@@ -82,7 +85,7 @@ output/. Returns the exit code (0 = no errors)."
         (setf aborted (princ-to-string e))))
     (setf results (nreverse results))
     (multiple-value-bind (result-path trace-path)
-        (write-outputs source results)
+        (write-outputs source results out-dir)
       (format *error-output*
               "~&[allisp] done: ~a forms, oracle ~a calls (~a misses, ~a hits), errors ~a~%~
                [allisp] result: ~a~%[allisp] trace:  ~a~%~@[[allisp] ABORTED (--strict): ~a~%~]"
