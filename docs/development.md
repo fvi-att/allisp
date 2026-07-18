@@ -24,8 +24,9 @@ src/
 ├── plugin.lisp     # Git/ASDF プラグインの取得とホスト実装の構文マクロ登録
 ├── eval.lisp       # メタ循環評価器、特殊形式、オラクル、文脈の同梱、エスカレーション
 ├── builtins.lisp   # CL の許可リストにあるビルトイン
+├── diff.lisp       # result ファイル 2 つの比較（allisp diff）
 ├── runner.lisp     # run-file、run-one-liner、result と trace の書き出し
-└── cli.lisp        # allisp run
+└── cli.lisp        # allisp run / diff / --one-liner
 tests/main.lisp     # fiveam スイート
 bin/allisp          # Roswell スクリプト
 Makefile            # test、build、install、clean
@@ -34,6 +35,9 @@ Makefile            # test、build、install、clean
 ## バックエンドの差し替え
 
 LLM 呼び出しは **`backend-complete` generic function** で抽象化している。
+backendが返すものは評価値ではなくLispコードである。`eval.lisp`の実行ゲートが
+コード全体を解決できるか検査し、解決済みならLLMを禁止して評価し、未解決なら
+`intermediate-code`として保持する。テスト用mockも値ではなく生成コードを返す。
 
 ```lisp
 (defgeneric backend-complete (backend prompt &key model))

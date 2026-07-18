@@ -5,15 +5,16 @@ Each file is standalone and demonstrates one evaluation path.
 | File | Evaluation path |
 |---|---|
 | `01-deterministic.lisp` | Defined functions and builtins only. No LLM call. |
-| `02-llm-oracle.lisp` | An undefined analysis form is pseudo-executed by the LLM oracle. |
-| `03-macro-oracle-deterministic.lisp` | Deterministic macro expansion, one LLM value, then deterministic processing. |
+| `02-llm-oracle.lisp` | An undefined analysis form is lowered to executable Lisp code by the LLM oracle. |
+| `03-macro-oracle-deterministic.lisp` | Deterministic macro expansion, one LLM-generated expression, then deterministic processing. |
 | `04-generate-file.lisp` | Evaluates a code-building function and writes the resulting program to another file. |
 | `05-solve-deterministic.lisp` | Recursive `goal` rules and deterministic `solve` deduction. |
 | `06-solve-llm-goal.lisp` | One LLM review result is used as input to a deterministic logic goal. |
 | `07-solve-constraints.lisp` | `constraint` filters branches after logic variables are bound. |
 | `08-defer-deprecate.lisp` | Preserves a deferred, unevaluated decision and marks an evaluated result as deprecated. |
-| `09-executable-adr.lisp` | An executable ADR: premises are `def` data, decisions are oracle forms. Editing one premise re-runs only the dependent decision. |
+| `09-executable-adr.lisp` | An executable ADR: premises are `def` data, decisions are oracle forms, and revisit triggers are data conditions the evaluator re-checks deterministically. |
 | `10-generate-markdown.lisp` | Renders structured data into a Markdown report and writes it to a plain `.md` file via `generate-file`. No LLM call. |
+| `11-markdown-to-lisp.lisp` | The reverse direction: `markdown->lisp` has the oracle convert a markdown runbook into an allisp program (prose forbidden) and writes it to a `.lisp` file. |
 
 Inspect the oracle boundary without making an LLM call:
 
@@ -28,6 +29,7 @@ bin/allisp run sample/07-solve-constraints.lisp --dry-run
 bin/allisp run sample/08-defer-deprecate.lisp --dry-run
 bin/allisp run sample/09-executable-adr.lisp --dry-run
 bin/allisp run sample/10-generate-markdown.lisp --dry-run
+bin/allisp run sample/11-markdown-to-lisp.lisp --dry-run
 ```
 
 Run a sample with the authenticated `claude` CLI:
@@ -37,6 +39,7 @@ bin/allisp run sample/02-llm-oracle.lisp
 bin/allisp run sample/03-macro-oracle-deterministic.lisp
 bin/allisp run sample/06-solve-llm-goal.lisp
 bin/allisp run sample/09-executable-adr.lisp
+bin/allisp run sample/11-markdown-to-lisp.lisp
 ```
 
 Generate and execute a program without an LLM call:
@@ -61,6 +64,20 @@ A `.md` target is not a `.lisp` target, so `generate-file` requires the body
 to evaluate to a string and writes it verbatim: no `generated-by` marker, no
 S-expression header, since Markdown has no comment syntax to embed one in.
 
+Convert a markdown document into an allisp program (one LLM call, cached):
+
+```sh
+bin/allisp run sample/11-markdown-to-lisp.lisp
+cat sample/output/deploy-runbook.lisp
+```
+
+`markdown->lisp` is the reverse of sample 10: the oracle converts the
+document under the anti-prose rules — every step and threshold becomes a
+structured S-expression or a small declarative DSL, never a restated string.
+The reply is one `(progn ...)` of top-level forms that is kept as a program,
+not executed; `:out` writes it with a `generated-by` marker so it can be run
+or `@use`'d on its own, and a rerun replays from the oracle cache.
+
 Results and oracle traces are written to `sample/output/`.
 
 ## Hybrid sample flow
@@ -69,16 +86,17 @@ The third sample evaluates in this order:
 
 1. `review-score` expands deterministically into a `let`, `list`, `+`, and
    `get-property` expression.
-2. Only the undefined `estimate-risk-adjustment` form is sent to the LLM.
-3. The returned plist is bound to `review`.
+2. Only the undefined `estimate-risk-adjustment` form is sent to the LLM for code generation.
+3. The generated expression is checked, evaluated deterministically, and its plist is bound to `review`.
 4. The expanded `get-property`, `+`, and `list` forms run deterministically.
 
-For example, an oracle value of
-`(:adjustment -12 :reason "Load testing is still open")` produces a final
-score of `58` from the deterministic `(+ 70 -12)` expression.
+For example, oracle code `(quote (:adjustment -12 :reason "Load testing is
+still open"))` produces a final score of `58` from the deterministic
+`(+ 70 -12)` expression.
 
-The oracle returns a value, not executable code. The macro supplies the code
-that consumes that value, keeping the final processing deterministic.
+The oracle returns Lisp code. Allisp executes it only when the whole expression
+is resolved; otherwise `intermediate-code` retains it for a later lowering
+pass. The macro then consumes the evaluated value deterministically.
 
 ## Premise-change replay (executable ADR)
 
@@ -94,6 +112,25 @@ bin/allisp run sample/09-executable-adr.lisp   # replay:     2 hits, no LLM call
 bin/allisp run sample/09-executable-adr.lisp   # 1 miss (decision), 1 hit (revisit-triggers)
 ```
 
-`decision` references all three premises and is re-thought. `revisit-triggers`
-references only `team-premise` and replays from cache. Reverting the premise
-restores the original cache entry, so the next run is again 2 hits.
+`decision` references the premises it names and is re-thought when one of them
+changes. `revisit-triggers` does not reference `budget-premise` and replays
+from cache. Reverting the premise restores the original cache entry, so the
+next run is again 2 hits.
+
+### Executable revisit triggers
+
+`plan-revisit-triggers` asks the oracle for data conditions, not prose: each
+trigger names a metric from `:metrics-available`, a direction
+(`at-or-above` / `at-or-below`), and a threshold. That plan is the whole LLM
+output surface. The check itself is the deterministic `trigger-fired?`
+function, evaluated against the `observed` premise:
+
+```sh
+# edit observed (e.g. :peak-orders-per-minute 46 → 85), then:
+bin/allisp run sample/09-executable-adr.lisp   # 0 misses — the trigger check
+                                               # is pure evaluator work
+```
+
+The final form reports `(:revisit-needed t :fired (...))` the moment an
+observation crosses a planned threshold. The LLM planned the conditions once;
+deciding whether to revisit never costs another LLM call.

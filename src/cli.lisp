@@ -5,14 +5,21 @@
 usage:
   allisp run <file.lisp> [options]
   allisp --one-liner \"<form>...\" [options]
+  allisp diff <old.result.lisp> <new.result.lisp>
 
   Evaluate an allisp source file or expression string. Defined forms evaluate deterministically;
-  unbound forms are pseudo-executed by the LLM oracle (claude CLI).
+  unbound forms are lowered to Lisp code by the LLM oracle; only fully resolved
+  generated code is executed by the deterministic evaluator.
   File mode writes <dir>/output/<name>.result.lisp and <name>.trace.lisp.
   One-liner mode prints the final value to standard output.
+  Diff mode compares two result files: def-family results match by name,
+  others by form; each differing value prints as one (changed|added|removed ...)
+  form. Exit 0 when identical, 1 when they differ. No LLM call.
 
 options:
-  --model <m>   default oracle model (sonnet | opus | haiku), default sonnet
+  --backend <b> oracle CLI (claude | codex), default claude
+  --model <m>   default oracle model (default: sonnet for claude,
+                gpt-5.6-terra for codex)
   --out-dir <dir>
                 write result/trace files under <dir> instead of <dir of source>/output/
                 (run mode only)
@@ -25,7 +32,7 @@ options:
 "))
 
 (defun parse-options (args)
-  (let (refresh strict dry-run model plugins no-explore out-dir)
+  (let (refresh strict dry-run model backend plugins no-explore out-dir)
     (loop while args
           for option = (pop args)
           do (cond
@@ -36,6 +43,9 @@ options:
                ((string= option "--model")
                 (unless args (error "--model needs a value"))
                 (setf model (pop args)))
+               ((string= option "--backend")
+                (unless args (error "--backend needs a value"))
+                (setf backend (pop args)))
                ((string= option "--out-dir")
                 (unless args (error "--out-dir needs a directory"))
                 (setf out-dir (pop args)))
@@ -43,26 +53,30 @@ options:
                 (unless args (error "--plugin needs a Git URL"))
                 (push (pop args) plugins))
                (t (error "unknown option: ~a" option))))
-    (values refresh strict dry-run model (nreverse plugins) no-explore out-dir)))
+    (values refresh strict dry-run model backend (nreverse plugins) no-explore out-dir)))
 
 (defun main (argv)
   (handler-case
       (cond
         ((and (string= (or (first argv) "") "run") (second argv))
-         (multiple-value-bind (refresh strict dry-run model plugins no-explore out-dir)
+         (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir)
              (parse-options (cddr argv))
            (uiop:quit (run-file (second argv)
                                 :refresh refresh :strict strict
-                                :dry-run dry-run :model model :plugins plugins
+                                :dry-run dry-run :model model :backend-name backend :plugins plugins
                                 :agentic (not no-explore) :out-dir out-dir))))
+        ((and (string= (or (first argv) "") "diff") (second argv) (third argv))
+         (when (cdddr argv)
+           (error "diff takes exactly two result files"))
+         (uiop:quit (diff-results (second argv) (third argv))))
         ((and (string= (or (first argv) "") "--one-liner") (second argv))
-         (multiple-value-bind (refresh strict dry-run model plugins no-explore out-dir)
+         (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir)
              (parse-options (cddr argv))
            (when out-dir
              (error "--out-dir only applies to run mode"))
            (uiop:quit (run-one-liner (second argv)
                                      :refresh refresh :strict strict
-                                     :dry-run dry-run :model model :plugins plugins
+                                     :dry-run dry-run :model model :backend-name backend :plugins plugins
                                      :agentic (not no-explore)))))
         (t (usage) (uiop:quit 2)))
     (error (e)

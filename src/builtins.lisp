@@ -31,6 +31,46 @@
   (with-allisp-syntax (format t "~&~a~%" (print-sexp x)))
   x)
 
+(defun b-allocate-memory-block (&key element-type integer-width length
+                                     (initialization :uninitialized))
+  "Allocate process-local mutable integer storage without reading an
+uninitialized element. Reads are gated by a separate initialization bitmap."
+  (unless (eq element-type :int)
+    (error "allocate-memory-block: unsupported element type ~a" element-type))
+  (unless (member integer-width '(32 64))
+    (error "allocate-memory-block: integer-width must be 32 or 64"))
+  (unless (and (integerp length) (not (minusp length)))
+    (error "allocate-memory-block: length must be a non-negative integer"))
+  (unless (eq initialization :uninitialized)
+    (error "allocate-memory-block: only :uninitialized is currently supported"))
+  (%make-managed-memory-block
+   :element-type element-type
+   :integer-width integer-width
+   :length length
+   :storage (make-array length
+                        :element-type `(signed-byte ,integer-width))
+   :initialized (make-array length :element-type 'bit :initial-element 0)))
+
+(defun check-memory-index (block index)
+  (unless (managed-memory-block-p block)
+    (error "expected a managed memory block"))
+  (unless (and (integerp index)
+               (<= 0 index)
+               (< index (managed-memory-block-length block)))
+    (error "memory block index out of bounds: ~a" index)))
+
+(defun b-memory-block-write (block index value)
+  (check-memory-index block index)
+  (setf (aref (managed-memory-block-storage block) index) value
+        (aref (managed-memory-block-initialized block) index) 1)
+  value)
+
+(defun b-memory-block-read (block index)
+  (check-memory-index block index)
+  (unless (= 1 (aref (managed-memory-block-initialized block) index))
+    (error "memory block element ~a is uninitialized" index))
+  (aref (managed-memory-block-storage block) index))
+
 (defun b-get-property (obj key &rest opts)
   "The DSL's (get-property list key [:default d]): find KEY in LIST by symbol
 name (symbols and keywords match each other) and return the next element."
@@ -71,6 +111,7 @@ name (symbols and keywords match each other) and return the next element."
    "NUMBERP" #'numberp "INTEGERP" #'integerp "KEYWORDP" #'keywordp
    "ZEROP" #'zerop "EVENP" #'evenp "ODDP" #'oddp "PLUSP" #'plusp "MINUSP" #'minusp
    "FUNCTIONP" #'b-functionp
+   "MANAGED-MEMORY-BLOCK-P" #'managed-memory-block-p
    ;; scheme-flavored aliases seen in thought files
    "EQUAL?" #'equal "EQ?" #'eq "NULL?" #'null
    "LIST?" #'listp "SYMBOL?" #'symbolp "STRING?" #'stringp "NUMBER?" #'numberp
@@ -82,6 +123,10 @@ name (symbols and keywords match each other) and return the next element."
    "STRING-TRIM" #'string-trim "STRING-APPEND" #'b-string-append
    "SYMBOL-NAME" #'symbol-name "PRINC-TO-STRING" #'princ-to-string
    "GENSYM" #'gensym "FORMAT" #'b-format "PRINT" #'b-print
+   ;; process-local managed memory
+   "ALLOCATE-MEMORY-BLOCK" #'b-allocate-memory-block
+   "MEMORY-BLOCK-WRITE" #'b-memory-block-write
+   "MEMORY-BLOCK-READ" #'b-memory-block-read
    ;; higher-order
    "MAPCAR" #'b-mapcar "MAPCAN" #'b-mapcan "MAPC" #'b-mapc
    "REMOVE-IF" #'b-remove-if "REMOVE-IF-NOT" #'b-remove-if-not

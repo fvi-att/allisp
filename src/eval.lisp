@@ -6,8 +6,9 @@
 ;;;
 ;;; 1. Normal-order oracle fallback — a form whose operator is unbound is NOT
 ;;;    an error and its arguments are NOT evaluated; the whole form plus its
-;;;    referenced definitions/bindings goes to the LLM oracle, which returns
-;;;    the form's value as one S-expression.
+;;;    referenced definitions/bindings goes to the LLM oracle.  The oracle
+;;;    generates Lisp code; allisp executes it only after every operator and
+;;;    referenced value can be resolved by the deterministic evaluator.
 ;;;
 ;;; 2. Effect-position escalation — an oracle cannot perform side effects, so
 ;;;    when an unbound form sits in effect position (its value would be
@@ -25,6 +26,19 @@
 Bound by generate-file around the body evaluation for non-.lisp targets,
 where the value is written verbatim into a script or document. The extra
 rule changes the prompt, so these calls get their own cache entries.")
+
+(defvar *oracle-fix-hint* nil
+  "When true, the oracle prompt gains a Fix-mode section: the target form is
+inert intermediate code, and the oracle is authorized to resolve it by
+choosing reasonable defaults, binding every assumption explicitly in the
+generated code. Bound by FIX. The extra section changes the prompt, so fix
+passes get their own cache entries.")
+
+(defvar *oracle-markdown-hint* nil
+  "When bound to (:label L :text T), the oracle prompt gains a markdown
+conversion section: the document T is to be converted into allisp forms with
+prose forbidden. Bound by MARKDOWN->LISP. The document is part of the prompt,
+so each document revision gets its own cache entry.")
 
 ;; ---------------------------------------------------------------- entry
 
@@ -227,7 +241,8 @@ Returns the value or +MISSING+."
     "LET" "LET*" "LAMBDA" "PROGN" "AND" "OR"
     "DEFUN" "DEFINE" "DEFMACRO" "DEF" "DEFVAR" "DEFPARAMETER"
     "SETQ" "SETF" "PUSH" "INCF" "DECF"
-    "@USE" "LLM" "PURE" "DEFER" "DEPRECATE" "RESULT"
+    "@USE" "LLM" "PURE" "FIX" "DEFER" "DEPRECATE" "RESULT" "INTERMEDIATE-CODE"
+    "MARKDOWN->LISP"
     "%GENERATE-FILE" "%GOAL" "%SOLVE" "%CONSTRAINT"))
 
 (defparameter +special-forms+
@@ -348,7 +363,12 @@ Returns the value or +MISSING+."
                  (unbound form env effect)))))
         ((is "@USE") (eval-use form env))
         ((is "RESULT") (eval-result form env))
+        ;; An unresolved oracle program is inert data. Normalize its reason so
+        ;; every stage records both why it stopped and how to continue.
+        ((is "INTERMEDIATE-CODE") (normalize-intermediate-code form))
         ((is "LLM") (eval-llm form env))
+        ((is "FIX") (eval-fix form env))
+        ((is "MARKDOWN->LISP") (eval-markdown->lisp form env))
         ((is "DEFER")
          ;; Preserve the decision's code verbatim.  The remaining arguments
          ;; are metadata and are evaluated so a reason can refer to bindings.
@@ -598,8 +618,9 @@ make the branch fail."
            (and (uiop:file-exists-p target)
                 (equal (truename *current-file*) (truename target))))))
 
-(defun generated-by-marker (source form generated-at)
-  (list (usym "GENERATED-BY") (usym "GENERATE-FILE")
+(defun generated-by-marker (source form generated-at
+                            &optional (generator (usym "GENERATE-FILE")))
+  (list (usym "GENERATED-BY") generator
         :source source :form form :generated-at generated-at))
 
 (defun write-generated-source (target value origin-form)
@@ -763,9 +784,185 @@ recorded the defined name as V, so their defs are not restored."
                  :context-mode (let ((c (safe-getf opts :context)))
                                  (unless (eq c +missing+) c)))))
 
+(defun eval-fix (form env)
+  "(fix <form> [:rounds N] [:model M] [:fresh F]): evaluate <form>; when the
+value is intermediate code, re-lower it in Fix mode, where the oracle chooses
+reasonable defaults for whatever :reason says is missing and binds every
+assumption explicitly in the generated code. An executed round returns
+(fixed :source <form> :code <generated> :value <value>), so the assumptions
+stay inspectable. Values that need no fix pass through unchanged; when all
+rounds stay unresolved, the last intermediate code is returned."
+  (destructuring-bind (subform &rest opts) (cdr form)
+    (let ((rounds (let ((r (safe-getf opts :rounds)))
+                    (if (eq r +missing+) 2 r)))
+          (model (let ((m (safe-getf opts :model)))
+                   (unless (eq m +missing+) (model-string m))))
+          (fresh (let ((f (safe-getf opts :fresh)))
+                   (and (not (eq f +missing+)) f)))
+          (value (a-eval subform env)))
+      (if (not (intermediate-code-p value))
+          value
+          (loop repeat rounds
+                do (multiple-value-bind (v status code)
+                       (let ((*oracle-fix-hint* t))
+                         (oracle-eval value env :model model :fresh fresh))
+                     (case status
+                       (:executed
+                        (return (list (usym "FIXED")
+                                      :source subform :code code :value v)))
+                       (:intermediate (setf value v))
+                       ;; dry-run placeholder or oracle error value
+                       (t (return v))))
+                finally (return value))))))
+
+;; ---------------------------------------------------------------- markdown->lisp
+
+(defun progn-forms (code)
+  "The markdown oracle replies with one (progn form...); unwrap it into the
+top-level forms. A single non-progn reply is one form."
+  (if (and (consp code) (symbolp (first code))
+           (string= (symbol-name (first code)) "PROGN"))
+      (rest code)
+      (list code)))
+
+(defun write-markdown-lisp (target forms origin-form source-label)
+  "Write the converted allisp FORMS with the same provenance preamble as
+generate-file, so the target can be @use'd and identifies its origin."
+  (let* ((generated-at (timestamp-string))
+         (source (if *current-file* (namestring *current-file*) "<one-liner>"))
+         (marker (generated-by-marker source origin-form generated-at
+                                      (usym "MARKDOWN->LISP"))))
+    (ensure-directories-exist target)
+    (with-open-file (out target :direction :output :if-exists :supersede
+                                :external-format :utf-8)
+      (format out ";; Generated by allisp markdown->lisp. Do not edit manually.~%")
+      (format out ";; markdown source: ~a~%;; generated: ~a~%~%"
+              source-label generated-at)
+      (write-string +generated-by-macro-source+ out)
+      (format out "~%~%~a~%" (print-sexp marker))
+      (dolist (f forms)
+        (format out "~%~a~%" (print-sexp (externalize f)))))
+    target))
+
+(defparameter +markdown->lisp-option-keys+ '(:from :out :model :fresh :eval))
+
+(defun parse-markdown-args (args)
+  "Split the markdown->lisp arguments into (values source-form opts).
+Known option pairs may appear anywhere; the first remaining element is the
+source form (+MISSING+ when absent). Extra dangling elements are ignored in
+the lenient DSL spirit."
+  (let ((source +missing+)
+        (opts '()))
+    (loop while args
+          for item = (pop args)
+          do (cond ((and (member item +markdown->lisp-option-keys+) args)
+                    (push item opts)
+                    (push (pop args) opts))
+                   ((eq source +missing+) (setf source item))))
+    (values source (nreverse opts))))
+
+(defun eval-markdown-arg (form env)
+  "Evaluate an input/output designator deterministically: an unbound piece
+becomes an error value instead of a wasted oracle call, and its diagnostic is
+rolled back so the caller reports the one meaningful error."
+  (let ((errors-before (and *run* (run-errors *run*))))
+    (let ((v (let ((*pure* t)) (a-eval form env))))
+      (when (and (allisp-error-value-p v) *run*)
+        (setf (run-errors *run*) errors-before))
+      v)))
+
+(defun eval-markdown->lisp (form env)
+  "(markdown->lisp <source> [:from :file|:text|<path>] [:out <path.lisp>]
+[:model M] [:fresh F] [:eval E]): convert a markdown document into allisp
+forms via the oracle, prose forbidden. <source> is a path relative to the
+current file (:from :file, the default) or the markdown text itself
+(:from :text); :from also accepts the path itself as a string, replacing
+<source>. Source and :out evaluate deterministically (never via the oracle).
+The generated program is returned as a list of top-level forms and is NOT
+executed; :out writes it to a .lisp file with a generated-by marker, :eval t
+additionally evaluates each form in the current environment (like @use). An
+unresolvable document comes back as intermediate-code."
+  (multiple-value-bind (source-form opts) (parse-markdown-args (cdr form))
+    (let* ((from (let ((f (safe-getf opts :from)))
+                   (if (eq f +missing+) :file f)))
+           (model (let ((m (safe-getf opts :model)))
+                    (unless (eq m +missing+) (model-string m))))
+           (fresh (let ((f (safe-getf opts :fresh)))
+                    (and (not (eq f +missing+)) f)))
+           (eval-p (let ((e (safe-getf opts :eval)))
+                     (and (not (eq e +missing+)) e)))
+           (out (let ((o (safe-getf opts :out)))
+                  (unless (eq o +missing+) (eval-markdown-arg o env))))
+           ;; :from "path.md" carries the path itself and replaces <source>.
+           (source (if (stringp from)
+                       from
+                       (and (not (eq source-form +missing+))
+                            (eval-markdown-arg source-form env)))))
+      (when (stringp from)
+        (setf from :file))
+      (unless (member from '(:file :text))
+        (return-from eval-markdown->lisp
+          (make-error-value :invalid-markdown-source form
+                            ":from must be :file, :text, or a markdown file path string")))
+      (unless (stringp source)
+        (return-from eval-markdown->lisp
+          (make-error-value :invalid-markdown-source form
+                            "markdown->lisp source must evaluate to a string; give a markdown file path as (markdown->lisp \"doc.md\" ...) or :from \"doc.md\", or inline text with :from :text")))
+      (when (and out (not (and (stringp out)
+                               (string-equal (pathname-type out) "lisp"))))
+        (return-from eval-markdown->lisp
+          (make-error-value :invalid-markdown-target form
+                            ":out must be a path to a .lisp file")))
+      (multiple-value-bind (text label)
+          (if (eq from :text)
+              (values source "<inline>")
+              (let ((path (generated-path source)))
+                (unless (uiop:file-exists-p path)
+                  (return-from eval-markdown->lisp
+                    (make-error-value :markdown-not-found form
+                                      (format nil "no such file: ~a"
+                                              (namestring path)))))
+                (values (uiop:read-file-string path) (namestring path))))
+        (let ((target (and out (generated-path out))))
+          (when (and target (source-and-target-equal-p target))
+            (return-from eval-markdown->lisp
+              (make-error-value :generated-path-is-source form
+                                "markdown->lisp cannot overwrite its source file")))
+          (multiple-value-bind (code status)
+              (let ((*oracle-markdown-hint* (list :label label :text text)))
+                (oracle-eval form env :model model :fresh fresh :execute nil))
+            (cond
+              ((eq status :dry-run)
+               (when target
+                 (format *error-output* "~&[allisp]   would generate ~a~%"
+                         (namestring target)))
+               code)
+              ((not (eq status :generated))
+               ;; oracle failure: the error value passes through
+               code)
+              ((intermediate-code-p code)
+               (normalize-intermediate-code code))
+              (t
+               (let ((forms (progn-forms code)))
+                 (when target
+                   (handler-case
+                       (progn
+                         (write-markdown-lisp target forms
+                                              *current-toplevel* label)
+                         (format *error-output* "~&[allisp]   generated ~a~%"
+                                 (namestring target)))
+                     (error (e)
+                       (return-from eval-markdown->lisp
+                         (make-error-value :generate-file-error form
+                                           (princ-to-string e))))))
+                 (when eval-p
+                   (dolist (f forms)
+                     (a-eval f env)))
+                 forms)))))))))
+
 ;; ---------------------------------------------------------------- oracle
 
-(defparameter +prompt-version+ "20260716-1")
+(defparameter +prompt-version+ "20260718-2")
 
 (defun form-symbols (form)
   (let ((acc '()))
@@ -811,34 +1008,60 @@ get separate cache entries."
        (backend-agentic (run-backend *run*))))
 
 (defun build-oracle-prompt (form context)
-  (format nil "You are the LLM oracle of allisp, a Lisp dialect for expressing human thinking and reasoning as S-expressions.
+  (format nil "You are the code-generation oracle of allisp, a Lisp dialect for expressing human thinking and reasoning as S-expressions.
 
-The deterministic evaluator evaluates everything it has definitions for. It has delegated the form at the end to you because its operator has no definition. Pseudo-execute that form, exactly as the author of this thinking DSL intended, and return its VALUE.
+The deterministic evaluator evaluates everything it has definitions for. It has delegated the form at the end to you because its operator has no definition. Generate Lisp CODE that computes what the author intended. You do not execute the form and must never claim that a real-world effect happened.
 
 Rules:
-1. Reply with EXACTLY ONE S-expression: the value of the form. No markdown fences, no prose before or after.
-2. The value must be plain Lisp data — lists, symbols, keywords, strings, numbers. Mirror the DSL's own shapes: tagged lists like (finding ...) / (conclusion ...) or plists (:key value ...).
-3. Definitions provided below are normative — honor their docstrings and structure.
-4. Actually perform the analysis or computation the form describes, concretely and specifically for the given data. Never restate the question, never answer generically.
-5. The value is the RESULT of executing the form — never a restatement, normalization, or paraphrase of the form itself. If most of the strings in your reply already appear in the input, you have not executed it. Include what execution produced that the form does not literally contain: evidence, derived judgments, concrete conclusions.
-6. Keep natural-language strings in the language of the source (Japanese stays Japanese, English stays English).
-~@[~a~]~@[~a~]
+1. Reply with EXACTLY ONE S-expression containing Lisp code. No markdown fences and no prose.
+2. Generate an expression that a Lisp evaluator can execute. To produce list data, generate (quote (...)) or code such as (list ...); never emit a bare data list as though it had executed.
+3. Use only definitions and bindings shown below, ordinary Lisp forms, and functions whose meaning is unambiguous. Do not invent an implementation for an unavailable effect such as allocation, file mutation, network access, deployment, or message sending.
+4. If one executable program is not uniquely determined, return inert intermediate code in this shape:
+   (intermediate-code :source (the original form) :reason (:why \"why lowering is unresolved\" :how \"specific action that can resolve it\") :constraints (...) :candidates (...))
+   Both :why and :how are mandatory. :how must name the missing definition, constraint, evidence, or choice and explain the next lowering step.
+   It will not be executed. Preserve enough information for a later (llm (intermediate-code ...)) pass to refine it.
+5. Definitions provided below are normative. Generated code must compute a concrete result rather than restating the request.
+6. Never claim an effect succeeded. Only the deterministic Lisp evaluator may execute generated code.
+7. Keep natural-language strings in the language of the source (Japanese stays Japanese, English stays English).
+8. Never embed a computed result inside a string literal. Any number, count, comparison, projection, or aggregate that can be derived from the bindings below must appear as an evaluable subexpression over those bindings (e.g. (* peak (expt (+ 1 growth) 4)) rather than the prose \"about 98 per minute\"), so the evaluator computes it and a changed premise changes the value. Reserve strings for genuinely non-computable judgment, and never restate in prose a value the generated code already computes.
+~@[~a~]~@[~a~]~@[~a~]~@[~a~]
 === Relevant definitions and bindings ===
 ~a
 
 === Enclosing top-level form ===
 ~a
 
-=== Pseudo-execute this form and return its value ===
+=== Generate Lisp code for this form ===
 ~a~%"
           (when *oracle-string-hint*
-            (format nil "7. The caller writes your value verbatim into a non-Lisp file (a script or document). Return it as EXACTLY ONE double-quoted Lisp string containing the complete text, with internal double quotes escaped as \\\".~%"))
+            (format nil "9. The caller writes the evaluated value verbatim into a non-Lisp file. Generate EXACTLY ONE double-quoted Lisp string literal containing the complete text, with internal double quotes escaped as \\\".~%"))
+          (when *oracle-fix-hint*
+            (format nil "
+=== Fix mode ===
+The target form below is inert intermediate code from a previous lowering pass. Resolve it now:
+- Treat :reason (:how ...) as the instruction for what was missing.
+- Where a premise, definition, or choice is missing, pick the most reasonable default; prefer an option listed in :candidates and honor every :constraints entry.
+- Bind every assumption you introduce explicitly in the generated code (e.g. a let of named premises with concrete values), so no assumed value stays hidden in prose.
+- Generate ONE executable Lisp expression for the deterministic evaluator. Return intermediate-code again only when no defaulted program can be justified.~%"))
+          (when *oracle-markdown-hint*
+            (format nil "
+=== Markdown conversion mode ===
+The target form asks you to convert the markdown document below into allisp source code, so the instructions it contains become processable by the deterministic evaluator. The generated code will NOT be executed here; it is kept as a program.
+- Reply with exactly ONE (progn ...) whose subforms are the converted top-level allisp forms, in document order.
+- Prose is forbidden: never restate the document as strings or comments. Every heading, instruction, list, table, step, and constraint becomes a structured S-expression: definitions (def / defun / defmacro), keyword-tagged plists, symbols, and numbers.
+- Prefer allisp's existing forms and types first (def, defun, defmacro, let, cond, goal / solve / constraint, defer, deprecate, generate-file, keywords, plists). Where the document has domain-specific structure those forms do not capture, design a small declarative DSL for it — unbound operators are lowered later by the oracle — instead of falling back to prose.
+- Keep a natural-language string only for genuinely non-computable content (e.g. a verbatim quotation), always as a short value inside a structured form.
+
+=== Markdown document (~a) ===
+~a~%"
+                    (getf *oracle-markdown-hint* :label)
+                    (getf *oracle-markdown-hint* :text)))
           (when (agentic-oracle-p)
             (format nil "
 === Environment ===
 source file: ~a
 project root: ~a
-You can read this repository with the Read, Glob, and Grep tools. Before answering, gather context: read the source file around the form, follow file paths the form mentions (basis / @use / relative paths), and consult neighboring files that bear on it. Then pseudo-execute the form against what you actually found. Your final reply must still be exactly one S-expression.~%"
+You can read this repository with the Read, Glob, and Grep tools. Before answering, gather context: read the source file around the form, follow file paths the form mentions (basis / @use / relative paths), and consult neighboring files that bear on it. Then generate Lisp code grounded in what you found. Your final reply must still be exactly one S-expression.~%"
                     (namestring *current-file*)
                     (namestring (run-root *run*))))
           (if (string= context "") "(none)" context)
@@ -867,7 +1090,13 @@ string responses get their own parser. Returns (values string ok-p)."
       (when (>= i len) (return (values nil nil)))   ; unterminated
       (let ((c (char s i)))
         (cond ((char= c #\")
-               (return (values (get-output-stream-string out) t)))
+               (let ((tail (subseq s (1+ i))))
+                 (return
+                   (if (every (lambda (x)
+                                (member x '(#\Space #\Newline #\Tab #\Return)))
+                              tail)
+                       (values (get-output-stream-string out) t)
+                       (values nil nil)))))
               ((and (char= c #\\) (< (1+ i) len))
                (let ((next (char s (1+ i))))
                  (write-char (case next
@@ -894,10 +1123,269 @@ string responses get their own parser. Returns (values string ok-p)."
                                                  (subseq s 0 paren))))
                               (subseq s paren)
                               s)))
-          (handler-case (values (read-allisp-string candidate) t)
+          (handler-case
+              (let ((forms (read-allisp-string-all candidate)))
+                (if (= (length forms) 1)
+                    (values (first forms) t)
+                    (values nil nil)))
             (error () (values nil nil)))))))
 
-(defun oracle-eval (form env &key model fresh context-mode)
+(defun symbol-resolved-p (symbol env lexical)
+  (or (member symbol lexical :test #'eq)
+      (nth-value 1 (env-lookup env symbol))))
+
+(defun lambda-bound-symbols (params)
+  "Return variables introduced by the supported lambda-list syntax."
+  (let ((tail params)
+        (result nil))
+    (loop while (consp tail)
+          for item = (pop tail)
+          unless (and (symbolp item)
+                      (plusp (length (symbol-name item)))
+                      (char= (char (symbol-name item) 0) #\&))
+            do (let ((name (if (consp item) (first item) item)))
+                 (when (symbolp name)
+                   (pushnew name result :test #'eq))))
+    (when (and tail (symbolp tail))
+      (pushnew tail result :test #'eq))
+    (nreverse result)))
+
+(defun generated-qq-resolved-p (form env lexical &optional (depth 1))
+  (cond
+    ((not (consp form)) t)
+    ((eq (car form) +unquote+)
+     (if (= depth 1)
+         (generated-code-resolved-p (second form) env lexical)
+         (generated-qq-resolved-p (second form) env lexical (1- depth))))
+    ((eq (car form) +unquote-splicing+)
+     (if (= depth 1)
+         (generated-code-resolved-p (second form) env lexical)
+         (generated-qq-resolved-p (second form) env lexical (1- depth))))
+    ((eq (car form) +quasiquote+)
+     (generated-qq-resolved-p (second form) env lexical (1+ depth)))
+    (t
+     (and (generated-qq-resolved-p (car form) env lexical depth)
+          (generated-qq-resolved-p (cdr form) env lexical depth)))))
+
+(defun generated-body-resolved-p (forms env lexical)
+  (every (lambda (item) (generated-code-resolved-p item env lexical)) forms))
+
+(defun generated-let-resolved-p (rest env lexical sequential)
+  (let ((bindings (first rest))
+        (body (rest rest))
+        (scope lexical))
+    (and
+     (listp bindings)
+     (every
+      (lambda (binding)
+        (let ((name (if (consp binding) (first binding) binding))
+              (init (and (consp binding) (second binding))))
+          (prog1
+              (and (symbolp name)
+                   (or (null init)
+                       (generated-code-resolved-p init env
+                                                  (if sequential scope lexical))))
+            (when (and sequential (symbolp name))
+              (pushnew name scope :test #'eq)))))
+      bindings)
+     (let ((all-names (remove-if-not
+                       #'symbolp
+                       (mapcar (lambda (binding)
+                                 (if (consp binding) (first binding) binding))
+                               bindings))))
+       (generated-body-resolved-p body env (append all-names lexical))))))
+
+(defun generated-code-resolved-p (form env &optional lexical)
+  "Conservatively decide whether FORM can run without another oracle call.
+This is a code gate, not a Common Lisp type checker.  It recognizes allisp's
+deterministic core and rejects oracle recursion and external I/O forms."
+  (cond
+    ((or (null form) (eq form t) (keywordp form) (not (symbolp form)))
+     (if (consp form)
+         (and (proper-list-p form)
+              (let* ((op (first form))
+                     (name (and (symbolp op) (symbol-name op)))
+                     (args (rest form)))
+                (cond
+                  ((and name (string= name "QUOTE")) (= (length args) 1))
+                  ((and name (string= name "QUASIQUOTE"))
+                   (and (= (length args) 1)
+                        (generated-qq-resolved-p (first args) env lexical)))
+                  ((and name (member name '("LLM" "FIX" "@USE" "%GENERATE-FILE"
+                                            "MARKDOWN->LISP")
+                                     :test #'string=))
+                   nil)
+                  ((and name (string= name "INTERMEDIATE-CODE")) nil)
+                  ((and name (string= name "IF"))
+                   (and (<= 2 (length args) 3)
+                        (generated-body-resolved-p args env lexical)))
+                  ((and name (member name '("PROGN" "AND" "OR" "WHEN" "UNLESS")
+                                     :test #'string=))
+                   (generated-body-resolved-p args env lexical))
+                  ((and name (string= name "COND"))
+                   (every (lambda (clause)
+                            (and (consp clause)
+                                 (let ((test (first clause)))
+                                   (and (or (eq test t)
+                                            (and (symbolp test)
+                                                 (string= (symbol-name test)
+                                                          "ELSE"))
+                                            (generated-code-resolved-p
+                                             test env lexical))
+                                        (generated-body-resolved-p
+                                         (rest clause) env lexical)))))
+                          args))
+                  ((and name (string= name "LET"))
+                   (generated-let-resolved-p args env lexical nil))
+                  ((and name (string= name "LET*"))
+                   (generated-let-resolved-p args env lexical t))
+                  ((and name (string= name "LAMBDA"))
+                   (and (consp args) (listp (first args))
+                        (generated-body-resolved-p
+                         (rest args) env
+                         (append (lambda-bound-symbols (first args)) lexical))))
+                  ((and name (member name '("DEFUN" "DEFMACRO") :test #'string=))
+                   (and (>= (length args) 3)
+                        (symbolp (first args))
+                        (listp (second args))
+                        (generated-body-resolved-p
+                         (cddr args) env
+                         (append (list (first args))
+                                 (lambda-bound-symbols (second args))
+                                 lexical))))
+                  ((and name (member name '("DEF" "DEFVAR" "DEFPARAMETER")
+                                     :test #'string=))
+                   (and (<= 1 (length args))
+                        (symbolp (first args))
+                        (or (> (length args) 2)
+                            (null (rest args))
+                            (generated-code-resolved-p (second args) env lexical))))
+                  ((and name (string= name "DEFINE"))
+                   (and (consp args)
+                        (if (consp (first args))
+                            (and (symbolp (first (first args)))
+                                 (generated-body-resolved-p
+                                  (rest args) env
+                                  (append (list (first (first args)))
+                                          (lambda-bound-symbols
+                                           (rest (first args)))
+                                          lexical)))
+                            (and (symbolp (first args))
+                                 (or (null (rest args))
+                                     (generated-code-resolved-p
+                                      (second args) env lexical))))))
+                  ((and name (member name '("SETQ" "SETF") :test #'string=))
+                   (and (evenp (length args))
+                        (loop for (place value) on args by #'cddr
+                              always (and (symbolp place)
+                                          (symbol-resolved-p place env lexical)
+                                          (generated-code-resolved-p
+                                           value env lexical)))))
+                  ((and name (member name '("INCF" "DECF") :test #'string=))
+                   (and (<= 1 (length args) 2)
+                        (symbolp (first args))
+                        (symbol-resolved-p (first args) env lexical)
+                        (or (null (rest args))
+                            (generated-code-resolved-p
+                             (second args) env lexical))))
+                  ((and name (string= name "PUSH"))
+                   (and (= (length args) 2)
+                        (generated-code-resolved-p (first args) env lexical)
+                        (symbolp (second args))
+                        (symbol-resolved-p (second args) env lexical)))
+                  ((and name (string= name "DEFER"))
+                   (generated-body-resolved-p (cddr args) env lexical))
+                  ((and name (member name '("PURE" "DEPRECATE")
+                                     :test #'string=))
+                   (generated-body-resolved-p args env lexical))
+                  ((and (symbolp op) (symbol-resolved-p op env lexical))
+                   (generated-body-resolved-p args env lexical))
+                  ((consp op)
+                   (and (generated-code-resolved-p op env lexical)
+                        (generated-body-resolved-p args env lexical)))
+                  (t nil))))
+         t))
+    ((symbolp form) (symbol-resolved-p form env lexical))
+    (t t)))
+
+(defun intermediate-code-p (form)
+  (and (consp form)
+       (symbolp (first form))
+       (string= (symbol-name (first form)) "INTERMEDIATE-CODE")))
+
+(defparameter +default-intermediate-how+
+  "Define the missing operators or replace them with available deterministic Lisp code, add any missing constraints or candidates, then run (llm (intermediate-code ...)) again.")
+
+(defun normalize-intermediate-reason (reason)
+  "Return a reason plist that always contains actionable :WHY and :HOW text.
+String reasons from the pre-structured format remain readable as :WHY."
+  (if (consp reason)
+      (let ((why (safe-getf reason :why))
+            (how (safe-getf reason :how)))
+        (list :why (if (eq why +missing+)
+                       "lowering is unresolved"
+                       why)
+              :how (if (eq how +missing+)
+                       +default-intermediate-how+
+                       how)))
+      (list :why (if (or (null reason) (eq reason +missing+))
+                     "lowering is unresolved"
+                     reason)
+            :how +default-intermediate-how+)))
+
+(defun normalize-intermediate-code (form)
+  "Normalize legacy or incomplete INTERMEDIATE-CODE to the current contract."
+  (let* ((copy (copy-tree form))
+         (reason (safe-getf (rest copy) :reason)))
+    (setf (getf (cdr copy) :reason)
+          (normalize-intermediate-reason reason))
+    copy))
+
+(defun unresolved-generated-code (source generated)
+  (list (usym "INTERMEDIATE-CODE")
+        :source source
+        :reason
+        (list :why
+              "generated code contains operators or references that the deterministic evaluator cannot resolve"
+              :how
+              "Define the unresolved operators in allisp or replace them with available deterministic Lisp code, then pass this intermediate code to llm for another lowering step.")
+        :generated generated))
+
+(defun allisp-error-value-p (value)
+  (and (consp value)
+       (eq (first value) (usym "ERROR"))))
+
+(defun materialize-oracle-code (source generated env)
+  "Execute GENERATED only when it is wholly deterministic.  Otherwise retain
+it as inert intermediate code for a later explicit oracle pass."
+  (cond
+    ((intermediate-code-p generated)
+     (values (normalize-intermediate-code generated) :intermediate))
+    ((not (generated-code-resolved-p generated env))
+     (values (unresolved-generated-code source generated) :intermediate))
+    (t
+     (let ((*pure* t)
+           (errors-before (and *run* (run-errors *run*))))
+       (handler-case
+           (let ((value (a-eval generated env)))
+             (if (allisp-error-value-p value)
+                 (progn
+                   ;; A conservative static check can still encounter an
+                   ;; unresolved macro expansion at runtime. It is staging,
+                   ;; not a program error, so retain the code and roll back
+                   ;; the diagnostic added by MAKE-ERROR-VALUE.
+                   (when *run*
+                     (setf (run-errors *run*) errors-before))
+                   (values (unresolved-generated-code source generated)
+                           :intermediate))
+                 (values value :executed)))
+         (error ()
+           (when *run*
+             (setf (run-errors *run*) errors-before))
+           (values (unresolved-generated-code source generated)
+                   :intermediate)))))))
+
+(defun oracle-eval (form env &key model fresh context-mode (execute t))
   (unless *run*
     (return-from oracle-eval
       (make-error-value :no-run form "oracle call outside of a run")))
@@ -912,20 +1400,25 @@ string responses get their own parser. Returns (values string ok-p)."
     (cond
       (cached
        (incf (run-hits *run*))
-       (log-oracle n :hit model form 0)
-       (push (list :n n :cache :hit :model model :hash hash
-                   :form form :value (getf cached :value))
-             (run-trace *run*))
-       (getf cached :value))
+       (let ((code (or (getf cached :code) (getf cached :value))))
+         (multiple-value-bind (value status)
+             (if execute
+                 (materialize-oracle-code form code env)
+                 (values code :generated))
+           (log-oracle n :hit model form 0 status)
+           (push (list :n n :cache :hit :model model :hash hash
+                       :form form :code code :status status :value value)
+                 (run-trace *run*))
+           (values value status code))))
       ((run-dry-run *run*)
        (log-oracle n :dry-run model form 0)
        (push (list :n n :cache :would-miss :model model :hash hash :form form)
              (run-trace *run*))
-       (list (usym "ORACLE-PENDING") (subseq hash 0 12)))
+       (values (list (usym "ORACLE-PENDING") (subseq hash 0 12)) :dry-run nil))
       (t
-       (call-oracle n form prompt hash model root)))))
+       (call-oracle n form prompt hash model root env execute)))))
 
-(defun call-oracle (n form prompt hash model root)
+(defun call-oracle (n form prompt hash model root env execute)
   (let ((start (get-internal-real-time)))
     (loop for attempt from 1 to 3
           for p = prompt then (concatenate
@@ -938,7 +1431,7 @@ string responses get their own parser. Returns (values string ok-p)."
                                        t)
                    (error (e) (values (princ-to-string e) nil)))
                (when call-ok
-                 (multiple-value-bind (value parse-ok) (parse-oracle-response raw)
+                 (multiple-value-bind (code parse-ok) (parse-oracle-response raw)
                    (when parse-ok
                      (let ((secs (/ (- (get-internal-real-time) start)
                                     internal-time-units-per-second)))
@@ -949,13 +1442,19 @@ string responses get their own parser. Returns (values string ok-p)."
                                         :model model
                                         :timestamp (timestamp-string)
                                         :form form
-                                        :value value
+                                        :code code
                                         :raw raw))
-                       (log-oracle n :miss model form secs)
-                       (push (list :n n :cache :miss :model model :hash hash
-                                   :seconds (float secs) :form form :value value)
-                             (run-trace *run*))
-                       (return-from call-oracle value)))))
+                       (multiple-value-bind (value status)
+                           (if execute
+                               (materialize-oracle-code form code env)
+                               (values code :generated))
+                         (log-oracle n :miss model form secs status)
+                         (push (list :n n :cache :miss :model model :hash hash
+                                     :seconds (float secs) :form form :code code
+                                     :status status :value value)
+                               (run-trace *run*))
+                         (return-from call-oracle
+                           (values value status code)))))))
                (when (= attempt 3)
                  (push (list :n n :cache :failed :model model :hash hash
                              :form form :detail raw)
@@ -966,9 +1465,9 @@ string responses get their own parser. Returns (values string ok-p)."
                     (format nil "no parseable S-expression after 3 attempts: ~a"
                             (truncate-string (or raw "") 400)))))))))
 
-(defun log-oracle (n kind model form secs)
-  (format *error-output* "~&[allisp]   oracle #~a ~(~a~) ~a ~a~@[ (~,1fs)~]~%"
-          n kind model (form-summary form 60)
+(defun log-oracle (n kind model form secs &optional status)
+  (format *error-output* "~&[allisp]   oracle #~a ~(~a~) ~a ~a~@[ → ~(~a~)~]~@[ (~,1fs)~]~%"
+          n kind model (form-summary form 60) status
           (when (and secs (> secs 0)) (float secs)))
   (force-output *error-output*))
 
@@ -979,6 +1478,16 @@ string responses get their own parser. Returns (values string ok-p)."
   (typecase v
     (closure (list (usym "CLOSURE") (or (closure-name v) (usym "ANONYMOUS"))))
     (macro-obj (list (usym "MACRO") (macro-obj-name v)))
+    (managed-memory-block
+     (list :resource :memory-block
+           :status :allocated
+           :element-type (managed-memory-block-element-type v)
+           :integer-width (managed-memory-block-integer-width v)
+           :length (managed-memory-block-length v)
+           :initialization :tracked
+           :initialized-count
+           (count 1 (managed-memory-block-initialized v))
+           :lifetime :current-process))
     (function (list (usym "BUILTIN")))
     (hash-table (list (usym "HASH-TABLE")))
     (cons (cons (externalize (car v)) (externalize (cdr v))))

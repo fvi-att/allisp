@@ -1,6 +1,6 @@
 ;; Hybrid evaluation:
 ;; 1. REVIEW-SCORE expands deterministically.
-;; 2. ESTIMATE-RISK-ADJUSTMENT is pseudo-executed by the LLM.
+;; 2. ESTIMATE-RISK-ADJUSTMENT is lowered to Lisp code by the LLM.
 ;; 3. GET-PROPERTY, +, and LIST process the returned value deterministically.
 
 (def release-context
@@ -33,8 +33,9 @@
 ;;         :final-score
 ;;         (+ 70 (get-property review :adjustment :default 0))))
 ;;
-;; For example, if the oracle returns
-;; (:adjustment -12 :reason "Load testing is still open"), the deterministic
-;; remainder produces :final-score 58.
+;; For example, if the oracle generates
+;; (quote (:adjustment -12 :reason "Load testing is still open")), the
+;; deterministic evaluator produces the plist and the remainder produces
+;; :final-score 58.
 
 (review-score 70 release-context)

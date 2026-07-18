@@ -103,9 +103,53 @@ Returns (values last-value run)."
   (is (eq (rd "high") (ev "(get-property '(x action-level high) 'action-level)")))
   (is (= 3 (ev "(get-property '(a b) 'zzz :default 3)"))))
 
+(test managed-memory-block-allocates-without-reading-uninitialized-storage
+  (multiple-value-bind (block run)
+      (ev "(allocate-memory-block
+             :element-type :int
+             :integer-width 32
+             :length 1
+             :initialization :uninitialized)")
+    (is (allisp::managed-memory-block-p block))
+    (is (= 32 (allisp::managed-memory-block-integer-width block)))
+    (is (= 1 (allisp::managed-memory-block-length block)))
+    (is (= 0 (count 1 (allisp::managed-memory-block-initialized block))))
+    (is (= 0 (calls run)))
+    (let ((public (allisp::externalize block)))
+      (is (eq :allocated (getf public :status)))
+      (is (= 0 (getf public :initialized-count))))))
+
+(test managed-memory-block-write-enables-read
+  (multiple-value-bind (v run)
+      (ev "(let ((block
+                   (allocate-memory-block
+                     :element-type :int
+                     :integer-width 32
+                     :length 1
+                     :initialization :uninitialized)))
+             (memory-block-write block 0 42)
+             (memory-block-read block 0))")
+    (is (= 42 v))
+    (is (= 0 (calls run)))))
+
+(test oracle-can-lower-memory-block-to-managed-allocation
+  (multiple-value-bind (block run)
+      (ev "(memory-block :type :int :length 1 :contents (:uninitialized))"
+          :responses
+          '("(allocate-memory-block
+               :element-type :int
+               :integer-width 32
+               :length 1
+               :initialization :uninitialized)"))
+    (is (allisp::managed-memory-block-p block))
+    (is (= 1 (calls run)))
+    (let ((entry (first (allisp::run-trace run))))
+      (is (eq :executed (getf entry :status))))))
+
 (test unbound-goes-to-oracle
   (multiple-value-bind (v run)
-      (ev "(mystery-analysis 1 2)" :responses '("(:answer 3)"))
+      (ev "(mystery-analysis 1 2)"
+          :responses '("(quote (:answer 3))"))
     (is (equal v (rd "(:answer 3)")))
     (is (= 1 (calls run)))))
 
@@ -113,9 +157,74 @@ Returns (values last-value run)."
   ;; normal-order: (- 40 :work-hours) inside an unbound form must not
   ;; reach the deterministic #'- as a keyword argument
   (multiple-value-bind (v run)
-      (ev "(calculation (- 40 :work-hours))" :responses '("ok"))
+      (ev "(calculation (- 40 :work-hours))" :responses '("(quote ok)"))
     (is (eq v (rd "ok")))
     (is (= 1 (calls run)))))
+
+(test oracle-executes-only-resolved-generated-code
+  (multiple-value-bind (v run)
+      (ev "(calculate-answer)" :responses '("(+ 20 22)"))
+    (is (= 42 v))
+    (is (= 1 (calls run)))
+    (let ((entry (first (allisp::run-trace run))))
+      (is (eq :executed (getf entry :status)))
+      (is (equal (rd "(+ 20 22)") (getf entry :code)))
+      (is (= 42 (getf entry :value))))))
+
+(test unresolved-generated-code-remains-intermediate
+  ;; The oracle can generate a proposed representation, but no allocation is
+  ;; claimed because neither operator exists in the deterministic evaluator.
+  (multiple-value-bind (v run)
+      (ev "(memory-alloc 1 :int)"
+          :responses '("(memory-block :type :int :length 1)"))
+    (is (allisp::intermediate-code-p v))
+    (is (equal (rd "(memory-alloc 1 :int)")
+               (getf (rest v) :source)))
+    (is (equal (rd "(memory-block :type :int :length 1)")
+               (getf (rest v) :generated)))
+    (let ((reason (getf (rest v) :reason)))
+      (is (search "cannot resolve" (getf reason :why)))
+      (is (search "Define" (getf reason :how))))
+    (is (= 1 (calls run)))
+    (is (eq :intermediate
+            (getf (first (allisp::run-trace run)) :status)))))
+
+(test oracle-intermediate-code-is-inert-and-replayable-as-data
+  (let ((ir "(intermediate-code
+               :source (choose-storage)
+               :reason (:why \"backend is not selected\"
+                        :how \"select postgres or sqlite\")
+               :constraints (:durable t)
+               :candidates ((use-postgres) (use-sqlite)))"))
+    (multiple-value-bind (v run)
+        (ev "(choose-storage)" :responses (list ir))
+      (is (equal (rd ir) v))
+      (is (= 1 (calls run))))
+    (multiple-value-bind (v run) (ev ir)
+      (is (equal (rd ir) v))
+      (is (= 0 (calls run))))))
+
+(test legacy-intermediate-reason-gains-why-and-how
+  (multiple-value-bind (v run)
+      (ev "(intermediate-code
+             :source (memory-block)
+             :reason \"allocation semantics are unavailable\")")
+    (let ((reason (getf (rest v) :reason)))
+      (is (string= "allocation semantics are unavailable"
+                   (getf reason :why)))
+      (is (stringp (getf reason :how)))
+      (is (plusp (length (getf reason :how)))))
+    (is (= 0 (calls run)))))
+
+(test unresolved-generated-macro-expansion-falls-back-to-intermediate
+  (multiple-value-bind (v run)
+      (ev "(defmacro emit-unknown () '(still-unknown))
+           (needs-lowering)"
+          :responses '("(emit-unknown)"))
+    (is (allisp::intermediate-code-p v))
+    (is (equal (rd "(emit-unknown)")
+               (getf (rest v) :generated)))
+    (is (null (allisp::run-errors run)))))
 
 (test defer-preserves-code-and-evaluates-its-metadata
   (multiple-value-bind (v run)
@@ -165,7 +274,11 @@ Returns (values last-value run)."
         (is (= v1 7))
         (is (= v2 7)) ; from cache, not the new mock response
         (is (= 1 (calls run1)))
-        (is (= 0 (calls run2)))))))
+        (is (= 0 (calls run2)))
+        (let* ((entry (first (allisp::run-trace run2)))
+               (cached (allisp::cache-get root (getf entry :hash))))
+          (is (= 7 (getf cached :code)))
+          (is (eq :executed (getf entry :status))))))))
 
 (test llm-forces-oracle
   (multiple-value-bind (v run) (ev "(llm (+ 1 2))" :responses '("3"))
@@ -183,7 +296,7 @@ Returns (values last-value run)."
   (multiple-value-bind (v run)
       (ev "(defmacro obs (name &rest data) \"Collect observations.\" `(record-obs ,name ,@data))
            (obs foo (x 1))"
-          :responses '("(recorded foo)"))
+          :responses '("(quote (recorded foo))"))
     (declare (ignore v))
     (is (= 1 (calls run)))
     (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
@@ -202,6 +315,44 @@ Returns (values last-value run)."
     (is (not (member "--allowedTools" plain :test #'string=)))
     (is (equal '("claude" "-p" "--model" "sonnet") plain))))
 
+(test codex-cli-args-use-read-only-ephemeral-execution
+  (let ((args (allisp::codex-cli-args
+               (make-instance 'allisp::codex-cli-backend) "test-model")))
+    (is (equal '("codex" "exec" "--ephemeral" "--skip-git-repo-check"
+                 "--model" "test-model" "--sandbox" "read-only" "-")
+               args))))
+
+(test backend-selection-uses-requested-cli-and-default-model
+  (let ((claude (allisp::make-cli-backend "claude"))
+        (codex (allisp::make-cli-backend "codex")))
+    (is (typep claude 'allisp::claude-cli-backend))
+    (is (typep codex 'allisp::codex-cli-backend))
+    (is (string= "sonnet" (allisp::backend-default-model claude)))
+    (is (string= "gpt-5.6-terra" (allisp::backend-default-model codex)))
+    (signals error (allisp::make-cli-backend "other"))))
+
+(test parse-options-accepts-backend
+  (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir)
+      (allisp::parse-options '("--backend" "codex" "--model" "test-model"
+                               "--dry-run"))
+    (is (not refresh))
+    (is (not strict))
+    (is (eq t dry-run))
+    (is (string= "test-model" model))
+    (is (string= "codex" backend))
+    (is (null plugins))
+    (is (not no-explore))
+    (is (null out-dir))))
+
+(test run-one-liner-selects-codex-backend-without-calling-it-in-dry-run
+  (let ((root (fresh-root)))
+    (is (= 0 (allisp:run-one-liner "(mystery 1)" :root root
+                                      :backend-name "codex" :dry-run t)))
+    (let* ((cache-dir (merge-pathnames ".allisp/oracle/" root))
+           (cache-files (when (uiop:directory-exists-p cache-dir)
+                          (uiop:directory-files cache-dir))))
+      (is (null cache-files)))))
+
 (test agentic-prompt-includes-environment-and-anti-echo
   (let* ((root (fresh-root))
          (source (make-empty-file (merge-pathnames "think.lisp" root)))
@@ -215,7 +366,7 @@ Returns (values last-value run)."
       (is (search (namestring source) prompt))
       (is (search (namestring root) prompt))
       (is (search "Read, Glob, and Grep" prompt))
-      (is (search "never a restatement" prompt)))))
+      (is (search "rather than restating" prompt)))))
 
 (test non-agentic-prompt-has-no-environment
   (let* ((root (fresh-root))
@@ -231,7 +382,7 @@ Returns (values last-value run)."
     (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
       (is (not (search "=== Environment ===" prompt)))
       ;; the anti-echo rule is unconditional
-      (is (search "never a restatement" prompt)))))
+      (is (search "rather than restating" prompt)))))
 
 (test one-liner-prompt-has-no-environment
   ;; no source file to explore from -> no exploration section
@@ -260,7 +411,7 @@ Returns (values last-value run)."
                   (synthesize-adder :increment 2))"))
          (run (make-test-run
                :root root
-               :responses '("(defun add-two (x) (+ x 2))"))))
+               :responses '("(quote (defun add-two (x) (+ x 2)))"))))
     (make-empty-file source)
     (let ((allisp::*run* run)
           (allisp::*current-file* source)
@@ -355,7 +506,7 @@ Returns (values last-value run)."
   (let ((out (make-string-output-stream))
         (err (make-string-output-stream))
         (backend (make-instance 'allisp::mock-backend
-                                :responses '("(:answer 3)")))
+                                :responses '("(quote (:answer 3))")))
         code)
     (let ((*standard-output* out)
           (*error-output* err))
@@ -371,10 +522,19 @@ Returns (values last-value run)."
 (test oracle-parse-retry-and-fences
   (multiple-value-bind (v run)
       (ev "(mystery 1)" :responses '("```lisp
-(:ok 1)
+(quote (:ok 1))
 ```"))
     (is (equal v (rd "(:ok 1)")))
     (is (= 1 (calls run)))))
+
+(test oracle-rejects-more-than-one-generated-form
+  (multiple-value-bind (v run)
+      (ev "(mystery 1)"
+          :responses '("(+ 1 2) (+ 3 4)"
+                       "(+ 1 2) (+ 3 4)"
+                       "(+ 1 2) (+ 3 4)"))
+    (is (allisp::allisp-error-value-p v))
+    (is (= 3 (calls run)))))
 
 (test error-value-continues
   ;; three toplevel forms; middle one fails to parse 3 times -> error value,
@@ -497,7 +657,8 @@ Returns (values last-value run)."
 (test lisp-target-prompt-has-no-string-hint
   (let* ((root (fresh-root))
          (source (make-empty-file (merge-pathnames "gen.lisp" root)))
-         (run (make-test-run :root root :responses '("(defun f (x) x)"))))
+         (run (make-test-run
+               :root root :responses '("(quote (defun f (x) x))"))))
     (let ((allisp::*run* run)
           (allisp::*current-file* source)
           (env (allisp::make-global-env)))
@@ -519,3 +680,253 @@ Returns (values last-value run)."
       (ev "(mystery 1)" :responses '("\"line1\\nline2 \\\"quoted\\\" tab\\there\""))
     (declare (ignore run))
     (is (string= (format nil "line1~%line2 \"quoted\" tab~ahere" #\Tab) v))))
+
+(test oracle-prompt-forbids-computed-results-in-strings
+  (multiple-value-bind (v run)
+      (ev "(mystery 1)" :responses '("42"))
+    (declare (ignore v))
+    (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
+      (is (search "Never embed a computed result inside a string literal"
+                  prompt)))))
+
+(test diff-results-reports-changed-added-removed
+  (let* ((root (fresh-root))
+         (old (merge-pathnames "old.result.lisp" root))
+         (new (merge-pathnames "new.result.lisp" root)))
+    (with-open-file (out old :direction :output :if-exists :supersede)
+      (write-string ";; allisp result
+(result :v 2 :n 1 :form (def peak 40) :value 40)
+(result :v 2 :n 2 :form (get-property decision :choice) :value direct-call)
+(result :v 2 :n 3 :form (length triggers) :value 4)
+(result :v 2 :n 4 :form (stale-check) :value old-only)
+" out))
+    (with-open-file (out new :direction :output :if-exists :supersede)
+      (write-string ";; allisp result
+(result :v 2 :n 1 :form (def peak 85) :value 85)
+(result :v 2 :n 2 :form (get-property decision :choice) :value message-queue)
+(result :v 2 :n 3 :form (length triggers) :value 4)
+(result :v 2 :n 4 :form (list :new t) :value (:new t))
+" out))
+    (let* ((s (make-string-output-stream))
+           (code (allisp::diff-results old new :out s))
+           (forms (allisp::read-allisp-string-all (get-output-stream-string s)))
+           (heads (mapcar (lambda (f) (symbol-name (first f))) forms)))
+      (is (= 1 code))
+      (is (equal '("CHANGED" "CHANGED" "ADDED" "REMOVED") heads))
+      (let ((premise (cdr (first forms))))
+        (is (eq (allisp::usym "PEAK") (getf premise :name)))
+        (is (= 40 (getf premise :old)))
+        (is (= 85 (getf premise :new))))
+      (let ((conclusion (cdr (second forms))))
+        (is (equal (rd "(get-property decision :choice)")
+                   (getf conclusion :form)))
+        (is (eq (allisp::usym "DIRECT-CALL") (getf conclusion :old)))
+        (is (eq (allisp::usym "MESSAGE-QUEUE") (getf conclusion :new)))))))
+
+(test diff-results-identical-files-return-zero
+  (let* ((root (fresh-root))
+         (old (merge-pathnames "same-old.result.lisp" root))
+         (new (merge-pathnames "same-new.result.lisp" root))
+         (text "(result :v 2 :n 1 :form (def peak 40) :value 40)
+(result :v 2 :n 2 :form (length triggers) :value 4)
+"))
+    (dolist (path (list old new))
+      (with-open-file (out path :direction :output :if-exists :supersede)
+        (write-string text out)))
+    (let* ((s (make-string-output-stream))
+           (code (allisp::diff-results old new :out s)))
+      (is (= 0 code))
+      (is (null (allisp::read-allisp-string-all
+                 (get-output-stream-string s)))))))
+
+(test reader-treats-ideographic-space-as-whitespace
+  (is (equal (rd "(list 1 2)")
+             (rd (format nil "(list 1~a2)" (code-char #x3000)))))
+  (multiple-value-bind (v run)
+      (ev (format nil "(+ 1~a2)" (code-char #x3000)))
+    (declare (ignore run))
+    (is (= 3 v))))
+
+(test markdown->lisp-converts-inline-text-to-forms
+  (multiple-value-bind (v run)
+      (ev "(markdown->lisp \"# rule\" :from :text)"
+          :responses '("(progn (def peak 40) (def growth 0.2))"))
+    (is (equal (list (rd "(def peak 40)") (rd "(def growth 0.2)")) v))
+    (is (= 1 (calls run)))
+    ;; The forms are a program, not evaluated definitions.
+    (multiple-value-bind (ignored found)
+        (allisp::env-lookup (allisp::make-global-env) (rd "peak"))
+      (declare (ignore ignored))
+      (is (not found)))
+    (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
+      (is (search "=== Markdown conversion mode ===" prompt))
+      (is (search "Prose is forbidden" prompt))
+      (is (search "=== Markdown document (<inline>) ===" prompt))
+      (is (search "# rule" prompt)))))
+
+(test markdown->lisp-wraps-single-form-response
+  (multiple-value-bind (v run)
+      (ev "(markdown->lisp \"do x\" :from :text)"
+          :responses '("(def steps '(x))"))
+    (is (equal (list (rd "(def steps '(x))")) v))
+    (is (= 1 (calls run)))))
+
+(test markdown->lisp-reads-file-and-writes-out
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "think.lisp" root)))
+         (doc (merge-pathnames "guide.md" root))
+         (target (merge-pathnames "out/guide.lisp" root))
+         (run (make-test-run
+               :root root
+               :responses '("(progn (def limit 3) (check-limit limit))"))))
+    (with-open-file (out doc :direction :output :if-exists :supersede)
+      (write-string "# limit is 3" out))
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (is (equal (list (rd "(def limit 3)") (rd "(check-limit limit)"))
+                 (allisp::eval-toplevel-form
+                  (rd "(markdown->lisp \"guide.md\" :out \"out/guide.lisp\")")
+                  env))))
+    (is (= 1 (calls run)))
+    (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
+      (is (search "# limit is 3" prompt))
+      (is (search (namestring doc) prompt)))
+    (is (probe-file target))
+    (let ((forms (allisp::read-allisp-file target)))
+      ;; generated-by macro + marker + the two converted forms
+      (is (= 4 (length forms)))
+      (is (eq (rd "defmacro") (first (first forms))))
+      (is (eq (rd "generated-by") (first (second forms))))
+      (is (eq (rd "markdown->lisp") (second (second forms))))
+      (is (equal (rd "(def limit 3)") (third forms)))
+      (is (equal (rd "(check-limit limit)") (fourth forms))))))
+
+(test markdown->lisp-eval-installs-definitions
+  (multiple-value-bind (v run)
+      (ev "(markdown->lisp \"# peak\" :from :text :eval t)
+           (pure peak)"
+          :responses '("(progn (def peak 40))"))
+    (is (= 40 v))
+    (is (= 1 (calls run)))))
+
+(test markdown->lisp-from-accepts-a-path-string
+  ;; (markdown->lisp :from "doc.md" ...) — the path travels in :from, with or
+  ;; without a dangling positional symbol, and no oracle call is wasted on it.
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "think.lisp" root)))
+         (doc (merge-pathnames "doc.md" root)))
+    (with-open-file (out doc :direction :output :if-exists :supersede)
+      (write-string "# three" out))
+    (dolist (call '("(markdown->lisp :from \"doc.md\")"
+                    "(markdown->lisp runbook-markdown :from \"doc.md\")"))
+      (let ((run (make-test-run :root root
+                                :responses '("(progn (def three 3))"))))
+        (let ((allisp::*run* run)
+              (allisp::*current-file* source)
+              (env (allisp::make-global-env)))
+          (is (equal (list (rd "(def three 3)"))
+                     (allisp::eval-toplevel-form (rd call) env))))
+        (is (= 1 (calls run)))
+        (is (null (allisp::run-errors run)))))))
+
+(test markdown->lisp-unbound-source-is-error-not-oracle-call
+  (multiple-value-bind (v run) (ev "(markdown->lisp runbook-markdown)")
+    (is (allisp::allisp-error-value-p v))
+    (is (eq :invalid-markdown-source (getf (rest v) :type)))
+    (is (search ":from :text" (getf (rest v) :detail)))
+    (is (= 0 (calls run)))
+    (is (= 1 (length (allisp::run-errors run))))))
+
+(test markdown->lisp-missing-file-is-error-value
+  (multiple-value-bind (v run) (ev "(markdown->lisp \"no-such.md\")")
+    (is (allisp::allisp-error-value-p v))
+    (is (eq :markdown-not-found (getf (rest v) :type)))
+    (is (= 0 (calls run)))))
+
+(test markdown->lisp-rejects-non-lisp-out
+  (multiple-value-bind (v run)
+      (ev "(markdown->lisp \"# x\" :from :text :out \"out.py\")")
+    (is (allisp::allisp-error-value-p v))
+    (is (eq :invalid-markdown-target (getf (rest v) :type)))
+    (is (= 0 (calls run)))))
+
+(test markdown->lisp-dry-run-does-not-call-or-write
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "think.lisp" root)))
+         (target (merge-pathnames "out/guide.lisp" root))
+         (run (make-test-run :root root)))
+    (setf (allisp::run-dry-run run) t)
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (let ((v (allisp::eval-toplevel-form
+                (rd "(markdown->lisp \"# x\" :from :text :out \"out/guide.lisp\")")
+                env)))
+        (is (eq (rd "oracle-pending") (first v)))))
+    (is (= 0 (calls run)))
+    (is (not (probe-file target)))))
+
+(test markdown->lisp-intermediate-code-passes-through-without-writing
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "think.lisp" root)))
+         (target (merge-pathnames "out/guide.lisp" root))
+         (run (make-test-run
+               :root root
+               :responses '("(intermediate-code
+                              :source (markdown->lisp \"# x\" :from :text)
+                              :reason (:why \"document is ambiguous\"
+                                       :how \"state the units\"))"))))
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (let ((v (allisp::eval-toplevel-form
+                (rd "(markdown->lisp \"# x\" :from :text :out \"out/guide.lisp\")")
+                env)))
+        (is (allisp::intermediate-code-p v))))
+    (is (= 1 (calls run)))
+    (is (not (probe-file target)))))
+
+(test markdown->lisp-conversion-is-cached-across-runs
+  (let ((root (fresh-root)))
+    (multiple-value-bind (v1 run1)
+        (ev "(markdown->lisp \"# rule\" :from :text)"
+            :run (make-test-run :responses '("(progn (def x 1))") :root root))
+      (multiple-value-bind (v2 run2)
+          (ev "(markdown->lisp \"# rule\" :from :text)"
+              :run (make-test-run :responses '("(progn (def x 2))") :root root))
+        (is (equal v1 v2)) ; replayed from cache, not the new mock response
+        (is (= 1 (calls run1)))
+        (is (= 0 (calls run2)))))))
+
+(test fix-passes-through-values-that-need-no-fix
+  (multiple-value-bind (v run) (ev "(fix (+ 1 2))")
+    (is (= 3 v))
+    (is (= 0 (calls run)))))
+
+(test fix-resolves-intermediate-code-with-fix-mode-prompt
+  (multiple-value-bind (v run)
+      (ev "(fix (mystery-plan 1))"
+          :responses
+          '("(intermediate-code :source (mystery-plan 1) :reason (:why \"stack unspecified\" :how \"define stack\"))"
+            "(let ((stack (quote python))) (list :stack stack :files 3))"))
+    (is (= 2 (calls run)))
+    (is (string= "FIXED" (symbol-name (first v))))
+    (is (equal (rd "(mystery-plan 1)")
+               (allisp::b-get-property v :source)))
+    (is (equal (rd "(let ((stack (quote python))) (list :stack stack :files 3))")
+               (allisp::b-get-property v :code)))
+    (is (equal (rd "(:stack python :files 3)")
+               (allisp::b-get-property v :value)))
+    (let ((prompts (reverse (allisp::mock-prompts (allisp::run-backend run)))))
+      (is (not (search "Fix mode" (first prompts))))
+      (is (search "Fix mode" (second prompts))))))
+
+(test fix-returns-last-intermediate-when-rounds-exhausted
+  (multiple-value-bind (v run)
+      (ev "(fix (mystery-plan 2) :rounds 1)"
+          :responses
+          '("(intermediate-code :source (mystery-plan 2) :reason (:why \"a\" :how \"b\"))"
+            "(intermediate-code :source (mystery-plan 2) :reason (:why \"c\" :how \"d\"))"))
+    (is (= 2 (calls run)))
+    (is (allisp::intermediate-code-p v))))

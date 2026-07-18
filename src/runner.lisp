@@ -53,15 +53,15 @@ use FILE's directory."
         (format out "~%~%")))
     (values result-path trace-path)))
 
-(defun run-file (path &key refresh strict dry-run model backend plugins (agentic t) out-dir)
+(defun run-file (path &key refresh strict dry-run model backend backend-name plugins (agentic t) out-dir)
   "Evaluate PATH as an allisp file. Writes result/trace next to it under
 output/, or under OUT-DIR when given. Returns the exit code (0 = no errors)."
   (let* ((source (truename path))
          (root (find-project-root source))
+         (actual-backend (or backend (make-cli-backend backend-name :agentic agentic)))
          (*run* (make-run :source source :root root
-                          :model (or model "sonnet")
-                          :backend (or backend (make-instance 'claude-cli-backend
-                                                              :agentic agentic))
+                          :model (or model (backend-default-model actual-backend))
+                          :backend actual-backend
                           :refresh refresh :strict strict :dry-run dry-run))
          (*current-file* source)
          (_ (load-plugins plugins root))
@@ -94,14 +94,14 @@ output/, or under OUT-DIR when given. Returns the exit code (0 = no errors)."
               (namestring result-path) (namestring trace-path) aborted))
     (if (or aborted (run-errors *run*)) 1 0)))
 
-(defun run-one-liner (source-text &key refresh strict dry-run model backend root plugins (agentic t))
+(defun run-one-liner (source-text &key refresh strict dry-run model backend backend-name root plugins (agentic t))
   "Evaluate the allisp forms in SOURCE-TEXT and print the final value.
 Returns the exit code (0 = no errors). No result or trace files are written."
   (let* ((root (or root (find-project-root (uiop:getcwd))))
+         (actual-backend (or backend (make-cli-backend backend-name :agentic agentic)))
          (*run* (make-run :source nil :root root
-                          :model (or model "sonnet")
-                          :backend (or backend (make-instance 'claude-cli-backend
-                                                              :agentic agentic))
+                          :model (or model (backend-default-model actual-backend))
+                          :backend actual-backend
                           :refresh refresh :strict strict :dry-run dry-run))
          (*current-file* nil)
          (_ (load-plugins plugins root))

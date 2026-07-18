@@ -14,6 +14,16 @@
                          (format s "#<macro ~a>" (macro-obj-name o)))))
   name params body env source)
 
+(defstruct (managed-memory-block
+             (:constructor %make-managed-memory-block)
+             (:print-function
+              (lambda (o s d)
+                (declare (ignore d))
+                (format s "#<memory-block ~ax~a-bit>"
+                        (managed-memory-block-length o)
+                        (managed-memory-block-integer-width o)))))
+  element-type integer-width length storage initialized)
+
 ;; ---------------------------------------------------------------- env
 
 (defstruct (env (:constructor %make-env))

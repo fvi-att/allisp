@@ -1,5 +1,5 @@
 (defsystem "allisp"
-  :description "allisp — a Lisp dialect where defined thought evaluates deterministically and undefined thought is pseudo-executed by an LLM oracle."
+  :description "allisp — a staged Lisp dialect where an LLM lowers undefined thought to code and the deterministic evaluator executes only resolved programs."
   :version "0.1.0"
   :depends-on ("uiop" "ironclad")
   :serial t
@@ -12,6 +12,7 @@
                (:file "plugin")
                (:file "eval")
                (:file "builtins")
+               (:file "diff")
                (:file "runner")
                (:file "cli"))
   :in-order-to ((test-op (test-op "allisp/tests"))))

@@ -1,8 +1,10 @@
 # Allisp
 
 Defined forms evaluate deterministically.
-Undefined forms go to an LLM oracle that **pseudo-executes** them.
-Allisp is a Lisp interpreter built on this boundary.
+For undefined forms, an LLM generates Lisp code but never executes it.
+Allisp runs that code only when its deterministic evaluator can resolve the
+whole program; otherwise it returns inert `intermediate-code` for another
+lowering pass.
 
 ```lisp
 (defun average (numbers)
@@ -14,20 +16,23 @@ Allisp is a Lisp interpreter built on this boundary.
 
 (average samples)                                ; defined → 15
 
-(summarize-metrics :samples samples)             ; undefined → the oracle returns an S-expression
+(summarize-metrics :samples samples)             ; undefined → the oracle generates Lisp code
 ```
 
 The more `defun` and `defmacro` definitions you add, the more of the program evaluates deterministically.
-The LLM fills in the thinking you left undefined.
-Oracle results land in a persistent cache, so rerunning the same input replays deterministically without calling the LLM.
+The LLM fills gaps by lowering them to code. It cannot claim that allocation,
+file mutation, deployment, message sending, or any other real-world effect
+happened. Generated code lands in a persistent cache, so rerunning the same
+input re-evaluates the same code deterministically without calling the LLM.
 
 ## Judgments no CPU could compute
 
 Until now, a program could only contain functions a CPU can compute.
 Judgments like "how risky is this release?" or "can this team operate a message queue?" have no deterministic definition, so they lived outside the program, in documents and meetings.
 
-In allisp, an undefined form is not an error: the whole form goes to the LLM for pseudo-execution.
-Write a judgment or an estimate as an undefined function application and it becomes an expression.
+In allisp, an undefined form is not immediately an error: the whole form goes
+to the LLM for code generation. A judgment or estimate becomes executable only
+after the generated expression contains no unresolved operation.
 
 ```lisp
 (classify-release-risk
@@ -35,11 +40,30 @@ Write a judgment or an estimate as an undefined function application and it beco
   :return-shape '(:risk-level symbol :reasons (string)))
 ```
 
-The oracle returns a value as an S-expression rather than prose.
-The value is data inside the language, so you can pass it straight to deterministic post-processing such as `get-property` or `filter`.
-One file holds the whole division of labor: the LLM makes the judgment, and your code constrains how the judgment is consumed.
+The oracle returns code as one S-expression rather than prose. For example,
+list data must be emitted as `(quote (:risk-level high ...))` or constructed
+with deterministic functions. Allisp verifies the code, executes it with LLM
+fallback disabled, and passes the resulting value to deterministic
+post-processing such as `get-property` or `filter`.
 
-During file execution, the oracle explores the repository with read-only tools and reads the files a form refers to before pseudo-executing it (disable with `--no-explore`).
+If a unique executable program cannot yet be generated, the result remains
+inert and retains constraints and candidates for a later pass:
+
+```lisp
+(intermediate-code
+  :source (choose-storage :durable t)
+  :reason (:why "the storage backend is not selected"
+           :how "select PostgreSQL or SQLite, then run another lowering pass")
+  :constraints (:durable t)
+  :candidates ((use-postgres) (use-sqlite)))
+```
+
+Evaluate `(llm <intermediate-code>)` explicitly when more context is available
+and another lowering pass is wanted.
+
+During file execution, the oracle explores the repository with read-only tools
+and reads the files a form refers to before generating code (disable with
+`--no-explore`).
 
 ## An ADR you can run
 
@@ -70,8 +94,11 @@ Each rerun bills you again, answers a bit differently, and leaves no way to matc
 
 In allisp, an LLM call is an expression in the language, and each run leaves two records.
 
-- **trace**: a record of every oracle call, including hash, model, cache hit or miss, and the returned value.
-- **oracle cache**: persisted under `.allisp/oracle/`, keyed by the sha256 of the prompt version, the model, and the full prompt text.
+- **trace**: a record of every oracle call, including generated code, whether
+  it was executed or retained as intermediate code, and its resulting value.
+- **oracle cache**: persisted under `.allisp/oracle/`, keyed by the sha256 of
+  the prompt version, the model, and the full prompt text. It stores generated
+  code, not a claim that an effect occurred.
 
 Rerunning the same input calls no API and returns identical values.
 Cost and variance disappear exactly as far as this replay reaches.
@@ -103,17 +130,31 @@ allisp run <file.lisp>               # run a file
 allisp run <file.lisp> --dry-run     # show what would reach the oracle, without calling the LLM
 allisp run <file.lisp> --refresh     # ignore the cache and re-run every oracle call
 allisp run <file.lisp> --strict      # stop at the first error (default: errors become values, execution continues)
+allisp run <file.lisp> --backend codex  # use the authenticated Codex CLI oracle
 allisp run <file.lisp> --model opus  # change the default model (sonnet | opus | haiku)
 allisp run <file.lisp> --no-explore  # disable the oracle's repository exploration (Read/Glob/Grep)
 allisp run <file.lisp> --out-dir results/  # write result/trace files under results/ instead of output/
 allisp --one-liner "(+ 1 2)"         # evaluate the forms in the string and print the last value
 allisp run thought.lisp --plugin 'https://example.com/review-syntax.git#<commit-sha>'
+allisp diff old.result.lisp new.result.lisp  # which premises changed, and which conclusions changed with them
 ```
 
 `--one-liner` accepts multiple forms.
 It evaluates them in order and prints only the last value to stdout as an S-expression.
 It writes no files and uses the current project's `.allisp/oracle/` as the LLM cache.
-`--dry-run`, `--refresh`, `--strict`, and `--model` combine with it.
+`--dry-run`, `--refresh`, `--strict`, `--backend`, and `--model` combine with it.
+
+`allisp diff` compares two result files without any LLM call: `def`-family
+results match by defined name, other results match by form, and each differing
+value prints as one `(changed ...)` / `(added ...)` / `(removed ...)`
+S-expression. Edit one premise, re-run, and diff the old and new result files
+to see exactly which conclusions that premise carried. Exit code 0 means
+identical, 1 means they differ.
+
+`--backend` accepts `claude` (the default) or `codex`.  The Claude backend
+uses the authenticated `claude` CLI and defaults to `sonnet`; the Codex backend
+uses `codex exec` in its read-only sandbox and defaults to `gpt-5.6-terra`.
+Pass `--model <model-id>` to choose a different model for either backend.
 
 ## Chaining results
 
@@ -127,7 +168,7 @@ Names bound with `def` upstream are restored just by loading the result file (no
 ;; downstream — lower the abstract DSL conclusion to Python
 (@use "./output/plan.result.lisp")
 (generate-file "generated/review.py"
-  (lower-to-python CONCLUSION))   ; the string the LLM returns is written out as raw Python
+  (lower-to-python CONCLUSION))   ; an LLM-generated string literal evaluates to raw Python
 ```
 
 When the target is not a `.lisp` file, `generate-file` writes the string value as raw text.
@@ -140,11 +181,13 @@ The **`generate-file` macro** writes the final value of its body to another file
 
 ```lisp
 (generate-file "generated/add-two.lisp"
-  (synthesize-adder :increment 2))  ; undefined, so the LLM returns a defun
+  (synthesize-adder :increment 2))  ; undefined, so the LLM generates quoted code
 ```
 
 Relative output paths resolve against the calling file.
-When the LLM returns `(defun add-two (x) (+ x 2))`, `generated/add-two.lisp` receives three forms:
+When the LLM generates `(quote (defun add-two (x) (+ x 2)))`, deterministic
+evaluation produces the `defun` as data and `generated/add-two.lisp` receives
+three forms:
 
 1. the definition of the `generated-by` macro
 2. a `generated-by` call recording the source, the original form, and the generation time

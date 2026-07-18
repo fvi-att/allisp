@@ -1,4 +1,5 @@
-;; LLM pseudo-execution: classify-release-risk has no deterministic definition.
+;; Staged LLM lowering: classify-release-risk has no deterministic definition.
+;; The oracle generates Lisp code; allisp runs it only when fully resolved.
 
 (def release-context
   '(:service "checkout-api"

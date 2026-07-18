@@ -22,6 +22,10 @@
     ;; :invert — lowercase source reads to uppercase symbol names and prints
     ;; back lowercase, so thought files round-trip with their original case.
     (setf (readtable-case rt) :invert)
+    ;; U+3000 ideographic space is whitespace: Japanese thought files
+    ;; inevitably contain it, and it otherwise parses as a package marker
+    ;; prefix ("Package 　 does not exist").
+    (set-syntax-from-char (code-char #x3000) #\Space rt)
     (set-macro-character
      #\' (lambda (s c) (declare (ignore c)) (list +quote+ (read s t nil t))) nil rt)
     (set-macro-character
