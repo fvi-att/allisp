@@ -15,6 +15,7 @@ Each file is standalone and demonstrates one evaluation path.
 | `09-executable-adr.lisp` | An executable ADR: premises are `def` data, decisions are oracle forms, and revisit triggers are data conditions the evaluator re-checks deterministically. |
 | `10-generate-markdown.lisp` | Renders structured data into a Markdown report and writes it to a plain `.md` file via `generate-file`. No LLM call. |
 | `11-markdown-to-lisp.lisp` | The reverse direction: `markdown->lisp` has the oracle convert a markdown runbook into an allisp program (prose forbidden) and writes it to a `.lisp` file. |
+| `12-spec-as-source.lisp` | The spec as the formal source of truth: one `def` spec generates a readable doc, a pytest test oracle, and a Python implementation that passes it; a spec query returns `intermediate-code` naming a hole in the invariants. |
 
 Inspect the oracle boundary without making an LLM call:
 
@@ -30,6 +31,7 @@ bin/allisp run sample/08-defer-deprecate.lisp --dry-run
 bin/allisp run sample/09-executable-adr.lisp --dry-run
 bin/allisp run sample/10-generate-markdown.lisp --dry-run
 bin/allisp run sample/11-markdown-to-lisp.lisp --dry-run
+bin/allisp run sample/12-spec-as-source.lisp --dry-run
 ```
 
 Run a sample with the authenticated `claude` CLI:
@@ -40,6 +42,7 @@ bin/allisp run sample/03-macro-oracle-deterministic.lisp
 bin/allisp run sample/06-solve-llm-goal.lisp
 bin/allisp run sample/09-executable-adr.lisp
 bin/allisp run sample/11-markdown-to-lisp.lisp
+bin/allisp run sample/12-spec-as-source.lisp
 ```
 
 Generate and execute a program without an LLM call:
@@ -77,6 +80,26 @@ structured S-expression or a small declarative DSL, never a restated string.
 The reply is one `(progn ...)` of top-level forms that is kept as a program,
 not executed; `:out` writes it with a `generated-by` marker so it can be run
 or `@use`'d on its own, and a rerun replays from the oracle cache.
+
+Run the spec-as-source-of-truth loop (4 oracle calls, cached):
+
+```sh
+bin/allisp run sample/12-spec-as-source.lisp
+python3 -m pytest sample/output/test_slugify.py   # generated impl vs. generated tests
+cat sample/output/slugify-spec.md                 # generated readable doc
+```
+
+The spec is the only handwritten artifact. The oracle generates the markdown
+document, the pytest test oracle, and the implementation (which it writes to
+pass the tests it can Read). The final `query-spec` form deliberately asks
+about an underspecified corner — an all-punctuation title, where `:collapse`
+and `:no-edge-hyphen` conflict — and comes back as `intermediate-code` whose
+`:how` names the `:examples` entry that would settle it. A rerun replays all
+four calls from cache with no LLM call.
+
+A full walkthrough of this workflow (spec structure, form ordering, turning
+an `intermediate-code` answer into a spec clause) is in
+[docs/spec-driven.md](../docs/spec-driven.md) (Japanese).
 
 Results and oracle traces are written to `sample/output/`.
 

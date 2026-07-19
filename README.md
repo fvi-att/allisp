@@ -1,5 +1,9 @@
 # Allisp
 
+Write the source of truth formally, as S-expressions, instead of natural
+language — then let an LLM generate everything derived from it: readable
+documents, test oracles, and implementations that must pass them.
+
 Defined forms evaluate deterministically.
 For undefined forms, an LLM generates Lisp code but never executes it.
 Allisp runs that code only when its deterministic evaluator can resolve the
@@ -24,6 +28,42 @@ The LLM fills gaps by lowering them to code. It cannot claim that allocation,
 file mutation, deployment, message sending, or any other real-world effect
 happened. Generated code lands in a persistent cache, so rerunning the same
 input re-evaluates the same code deterministically without calling the LLM.
+
+## The spec is the source of truth
+
+A natural-language spec cannot be the canonical record: it drifts, nothing
+checks it, and every reader parses it differently. In allisp the spec is a
+formal object — `def` bindings of invariants and examples — and everything a
+human or CI consumes is generated from it, never the other way around:
+
+- **readable document** — the oracle renders the spec for people
+- **test oracle** — examples and invariants are lowered to runnable tests
+- **implementation** — generated to pass the test oracle, in any target language
+
+Code generation is delegated to the LLM; execution never is. Generated Lisp
+runs only under the deterministic evaluator, and generated Python or Markdown
+is written out as text for external tools to run. An unchanged spec replays
+every artifact from cache, byte-identical, with no LLM call — the derived
+artifacts cannot drift from the record they came from. Edit one clause and
+only the forms that reference it are re-generated.
+
+Questions about the spec also go through the formal model, not prose.
+[sample/12-spec-as-source.lisp](sample/12-spec-as-source.lisp) is the whole
+loop in one file, and its final form asks about a corner the invariants
+deliberately leave open. The oracle does not pick an answer: it returns
+`intermediate-code` whose `:reason` names the two conflicting invariants and
+whose `:how` says which example to add to the spec to settle it. Asking a
+formal model finds the hole that prose would have papered over.
+
+```sh
+bin/allisp run sample/12-spec-as-source.lisp     # 4 oracle calls, cached
+python3 -m pytest sample/output/test_slugify.py  # implementation vs. test oracle
+bin/allisp run sample/12-spec-as-source.lisp     # replay: 4 hits, no LLM call
+```
+
+A step-by-step walkthrough of this workflow — how to structure a spec, order
+the generation forms, and turn an `intermediate-code` answer back into a spec
+clause — is in [docs/spec-driven.md](docs/spec-driven.md) (Japanese).
 
 ## Judgments no CPU could compute
 
@@ -112,6 +152,7 @@ This repository excludes personal settings, IDE settings, oracle caches, and exe
 The license is the [GNU General Public License v3.0](LICENSE) (GPL-3.0-only).
 
 - Language spec (execution boundary, `llm`, `pure`, `@use`, error values, cache): [docs/language.md](docs/language.md) (Japanese)
+- Spec-driven generation guide (spec as the source of truth → docs / tests / implementation): [docs/spec-driven.md](docs/spec-driven.md) (Japanese)
 - Development guide (tests, source layout, swapping backends): [docs/development.md](docs/development.md) (Japanese)
 - Design decision history: [DESIGN.md](DESIGN.md) (Japanese)
 - Samples mixing determinism, LLM calls, and macros: [sample/README.md](sample/README.md)
