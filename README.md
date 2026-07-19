@@ -168,6 +168,7 @@ bin/allisp run sample/01-deterministic.lisp --dry-run
 
 ```sh
 allisp run <file.lisp>               # run a file
+allisp run <dir>                     # run every top-level *.lisp in <dir>, filename order (non-recursive)
 allisp run <file.lisp> --dry-run     # show what would reach the oracle, without calling the LLM
 allisp run <file.lisp> --refresh     # ignore the cache and re-run every oracle call
 allisp run <file.lisp> --strict      # stop at the first error (default: errors become values, execution continues)
@@ -239,11 +240,16 @@ Evaluating the generated file binds the generation record to `*generated-by*` as
 
 ## Input and output
 
-**Input**: one `.lisp` file in allisp form.
+**Input**: one `.lisp` file in allisp form, or a directory.
 Each toplevel S-expression evaluates in order from the top.
 `(@use "relative/path")` inherits the definitions of another file.
+A directory runs every top-level `*.lisp` file it contains (non-recursive,
+filename order, generated `*.result.lisp`/`*.trace.lisp` excluded) as
+independent runs sharing no environment. Without `--strict`, a failing file
+is recorded and the rest still run; with `--strict`, the first failing file
+aborts the remaining ones too. The process exit code is `1` if any file failed.
 
-**Output**: two files under `output/` next to the input file (`--out-dir <dir>` redirects them to `<dir>`).
+**Output**: two files under `output/` next to the input file (`--out-dir <dir>` redirects them to `<dir>`; in directory mode, `<dir>` is shared by every file).
 
 ```
 your_folder/

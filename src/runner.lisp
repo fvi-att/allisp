@@ -94,6 +94,58 @@ output/, or under OUT-DIR when given. Returns the exit code (0 = no errors)."
               (namestring result-path) (namestring trace-path) aborted))
     (if (or aborted (run-errors *run*)) 1 0)))
 
+(defun result-or-trace-file-p (path)
+  "True if PATH looks like a generated foo.result.lisp / foo.trace.lisp file."
+  (let ((name (pathname-name path)))
+    (and (stringp name)
+         (or (uiop:string-suffix-p name ".result")
+             (uiop:string-suffix-p name ".trace")))))
+
+(defun directory-lisp-files (dir)
+  "Top-level (non-recursive) *.lisp source files in DIR, excluding generated
+result/trace files, sorted by filename."
+  (sort (remove-if #'result-or-trace-file-p (uiop:directory-files dir "*.lisp"))
+        #'string< :key #'file-namestring))
+
+(defun run-directory (dir &key refresh strict dry-run model backend backend-name plugins (agentic t) out-dir)
+  "Run every top-level *.lisp file in DIR in filename order, each as an
+independent run-file call. Returns 1 if any file failed, else 0."
+  (let* ((dir-path (uiop:ensure-directory-pathname (truename dir)))
+         (files (directory-lisp-files dir-path))
+         (total (length files))
+         (attempted 0)
+         (failed '())
+         (any-error nil))
+    (when (zerop total)
+      (error "no *.lisp files found in ~a" (namestring dir-path)))
+    (format *error-output* "~&[allisp] batch: ~a (~a files)~%" (namestring dir-path) total)
+    (loop for file in files
+          for i from 1
+          do (incf attempted)
+             (format *error-output* "~&[allisp] === [~a/~a] ~a ===~%" i total (file-namestring file))
+             (force-output *error-output*)
+             (let ((status
+                     (handler-case
+                         (run-file file :refresh refresh :strict strict :dry-run dry-run
+                                        :model model :backend backend :backend-name backend-name
+                                        :plugins plugins :agentic agentic :out-dir out-dir)
+                       (error (e)
+                         (format *error-output* "~&[allisp] error: ~a: ~a~%" (file-namestring file) e)
+                         1))))
+               (unless (zerop status)
+                 (setf any-error t)
+                 (push (file-namestring file) failed)
+                 (when strict
+                   (format *error-output* "~&[allisp] --strict: aborting batch after ~a~%" (file-namestring file))
+                   (loop-finish)))))
+    (setf failed (nreverse failed))
+    (format *error-output* "~&[allisp] batch done: ~a files, ~a ok, ~a failed~@[, ~a skipped (--strict)~]~%"
+            total (- attempted (length failed)) (length failed)
+            (and (< attempted total) (- total attempted)))
+    (dolist (f failed)
+      (format *error-output* "[allisp]   failed: ~a~%" f))
+    (if any-error 1 0)))
+
 (defun run-one-liner (source-text &key refresh strict dry-run model backend backend-name root plugins (agentic t))
   "Evaluate the allisp forms in SOURCE-TEXT and print the final value.
 Returns the exit code (0 = no errors). No result or trace files are written."

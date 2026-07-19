@@ -930,3 +930,73 @@ Returns (values last-value run)."
             "(intermediate-code :source (mystery-plan 2) :reason (:why \"c\" :how \"d\"))"))
     (is (= 2 (calls run)))
     (is (allisp::intermediate-code-p v))))
+
+;; ---------------------------------------------------------------- run-directory
+
+(defun write-lisp (path text)
+  (ensure-directories-exist path)
+  (with-open-file (out path :direction :output :if-exists :supersede)
+    (write-string text out))
+  path)
+
+(test run-directory-runs-all-files-in-filename-order
+  (let* ((root (fresh-root)))
+    (write-lisp (merge-pathnames "02-b.lisp" root) "(+ 1 1)")
+    (write-lisp (merge-pathnames "01-a.lisp" root) "(+ 1 1)")
+    (let ((out (make-string-output-stream))
+          (err (make-string-output-stream))
+          code)
+      (let ((*standard-output* out) (*error-output* err))
+        (setf code (allisp::run-directory
+                    root :backend (make-instance 'allisp::mock-backend))))
+      (is (= 0 code))
+      (is (probe-file (merge-pathnames "output/01-a.result.lisp" root)))
+      (is (probe-file (merge-pathnames "output/02-b.result.lisp" root)))
+      (let* ((log (get-output-stream-string err))
+             (pos-a (search "01-a.lisp" log))
+             (pos-b (search "02-b.lisp" log)))
+        (is (and pos-a pos-b (< pos-a pos-b)))))))
+
+(test run-directory-is-not-recursive-and-excludes-result-and-trace-files
+  (let* ((root (fresh-root)))
+    (write-lisp (merge-pathnames "top.lisp" root) "(+ 1 1)")
+    (write-lisp (merge-pathnames "top.result.lisp" root) "stray result")
+    (write-lisp (merge-pathnames "top.trace.lisp" root) "stray trace")
+    (write-lisp (merge-pathnames "nested/inner.lisp" root) "(error \"should not run\")")
+    (is (= 0 (allisp::run-directory
+              root :backend (make-instance 'allisp::mock-backend))))
+    (is (probe-file (merge-pathnames "output/top.result.lisp" root)))))
+
+(test run-directory-errors-when-no-lisp-files-found
+  (let ((root (fresh-root)))
+    (signals error
+      (allisp::run-directory root :backend (make-instance 'allisp::mock-backend)))))
+
+(test run-directory-continues-past-a-failing-file-without-strict
+  (let* ((root (fresh-root)))
+    (write-lisp (merge-pathnames "01-bad.lisp" root) "(/ 1 0)")
+    (write-lisp (merge-pathnames "02-good.lisp" root) "(+ 1 1)")
+    (is (= 1 (allisp::run-directory
+              root :backend (make-instance 'allisp::mock-backend))))
+    (is (probe-file (merge-pathnames "output/01-bad.result.lisp" root)))
+    (is (probe-file (merge-pathnames "output/02-good.result.lisp" root)))))
+
+(test run-directory-strict-aborts-remaining-files
+  (let* ((root (fresh-root)))
+    (write-lisp (merge-pathnames "01-bad.lisp" root) "(/ 1 0)")
+    (write-lisp (merge-pathnames "02-good.lisp" root) "(+ 1 1)")
+    (is (= 1 (allisp::run-directory
+              root :strict t :backend (make-instance 'allisp::mock-backend))))
+    (is (probe-file (merge-pathnames "output/01-bad.result.lisp" root)))
+    (is (not (probe-file (merge-pathnames "output/02-good.result.lisp" root))))))
+
+(test run-directory-out-dir-is-shared-across-files
+  (let* ((root (fresh-root))
+         (out-dir (merge-pathnames "elsewhere/" root)))
+    (write-lisp (merge-pathnames "01-a.lisp" root) "(+ 1 1)")
+    (write-lisp (merge-pathnames "02-b.lisp" root) "(+ 2 2)")
+    (is (= 0 (allisp::run-directory
+              root :out-dir (namestring out-dir)
+                   :backend (make-instance 'allisp::mock-backend))))
+    (is (probe-file (merge-pathnames "01-a.result.lisp" out-dir)))
+    (is (probe-file (merge-pathnames "02-b.result.lisp" out-dir)))))

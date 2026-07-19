@@ -4,6 +4,7 @@
   (format *error-output* "~
 usage:
   allisp run <file.lisp> [options]
+  allisp run <dir> [options]
   allisp --one-liner \"<form>...\" [options]
   allisp diff <old.result.lisp> <new.result.lisp>
 
@@ -11,6 +12,10 @@ usage:
   unbound forms are lowered to Lisp code by the LLM oracle; only fully resolved
   generated code is executed by the deterministic evaluator.
   File mode writes <dir>/output/<name>.result.lisp and <name>.trace.lisp.
+  Directory mode runs every top-level *.lisp file in <dir> (non-recursive, filename
+  order, generated *.result.lisp/*.trace.lisp excluded) as independent runs. Without
+  --strict a failing file is recorded and the rest still run; exit is 1 if any file
+  failed. With --strict the first failing file aborts the remaining files too.
   One-liner mode prints the final value to standard output.
   Diff mode compares two result files: def-family results match by name,
   others by form; each differing value prints as one (changed|added|removed ...)
@@ -22,7 +27,7 @@ options:
                 gpt-5.6-terra for codex)
   --out-dir <dir>
                 write result/trace files under <dir> instead of <dir of source>/output/
-                (run mode only)
+                (run mode only; in directory mode, shared across all files)
   --refresh     ignore the oracle cache and re-ask every oracle form
   --strict      stop at the first error instead of embedding error values
   --dry-run     no LLM calls; report which forms would go to the oracle
@@ -61,10 +66,15 @@ options:
         ((and (string= (or (first argv) "") "run") (second argv))
          (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir)
              (parse-options (cddr argv))
-           (uiop:quit (run-file (second argv)
-                                :refresh refresh :strict strict
-                                :dry-run dry-run :model model :backend-name backend :plugins plugins
-                                :agentic (not no-explore) :out-dir out-dir))))
+           (uiop:quit (if (uiop:directory-exists-p (second argv))
+                          (run-directory (second argv)
+                                        :refresh refresh :strict strict
+                                        :dry-run dry-run :model model :backend-name backend :plugins plugins
+                                        :agentic (not no-explore) :out-dir out-dir)
+                          (run-file (second argv)
+                                    :refresh refresh :strict strict
+                                    :dry-run dry-run :model model :backend-name backend :plugins plugins
+                                    :agentic (not no-explore) :out-dir out-dir)))))
         ((and (string= (or (first argv) "") "diff") (second argv) (third argv))
          (when (cdddr argv)
            (error "diff takes exactly two result files"))
