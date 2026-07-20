@@ -53,9 +53,11 @@ use FILE's directory."
         (format out "~%~%")))
     (values result-path trace-path)))
 
-(defun run-file (path &key refresh strict dry-run model backend backend-name plugins (agentic t) out-dir)
+(defun run-file (path &key refresh strict dry-run model backend backend-name plugins (agentic t) out-dir verify)
   "Evaluate PATH as an allisp file. Writes result/trace next to it under
-output/, or under OUT-DIR when given. Returns the exit code (0 = no errors)."
+output/, or under OUT-DIR when given. With VERIFY, registered (verify ...)
+commands run after all forms have evaluated, before the result file is
+written. Returns the exit code (0 = no errors)."
   (let* ((source (truename path))
          (root (find-project-root source))
          (actual-backend (or backend (make-cli-backend backend-name :agentic agentic)))
@@ -84,6 +86,14 @@ output/, or under OUT-DIR when given. Returns the exit code (0 = no errors)."
       (error (e)
         (setf aborted (princ-to-string e))))
     (setf results (nreverse results))
+    (when (and verify (run-verifications *run*) (not aborted))
+      (if (run-dry-run *run*)
+          (dolist (r (reverse (run-verifications *run*)))
+            (format *error-output* "~&[allisp]   would verify ~s~%"
+                    (spec-property (cdr r) :command)))
+          ;; Completing a verification record mutates the shared cons, so the
+          ;; outcome (or the error value) lands in the result file below.
+          (setf aborted (execute-verifications source))))
     (multiple-value-bind (result-path trace-path)
         (write-outputs source results out-dir)
       (format *error-output*
@@ -107,7 +117,7 @@ result/trace files, sorted by filename."
   (sort (remove-if #'result-or-trace-file-p (uiop:directory-files dir "*.lisp"))
         #'string< :key #'file-namestring))
 
-(defun run-directory (dir &key refresh strict dry-run model backend backend-name plugins (agentic t) out-dir)
+(defun run-directory (dir &key refresh strict dry-run model backend backend-name plugins (agentic t) out-dir verify)
   "Run every top-level *.lisp file in DIR in filename order, each as an
 independent run-file call. Returns 1 if any file failed, else 0."
   (let* ((dir-path (uiop:ensure-directory-pathname (truename dir)))
@@ -128,7 +138,8 @@ independent run-file call. Returns 1 if any file failed, else 0."
                      (handler-case
                          (run-file file :refresh refresh :strict strict :dry-run dry-run
                                         :model model :backend backend :backend-name backend-name
-                                        :plugins plugins :agentic agentic :out-dir out-dir)
+                                        :plugins plugins :agentic agentic :out-dir out-dir
+                                        :verify verify)
                        (error (e)
                          (format *error-output* "~&[allisp] error: ~a: ~a~%" (file-namestring file) e)
                          1))))

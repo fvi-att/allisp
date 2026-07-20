@@ -85,6 +85,11 @@ name (symbols and keywords match each other) and return the next element."
               finally (return default))
         default)))
 
+;; Spec accessors: zero-cost reads over the plist a defspec binds.
+(defun b-spec-invariants (spec) (spec-invariant-names spec))
+(defun b-spec-invariant (spec name) (spec-invariant-text spec name))
+(defun b-spec-examples (spec) (spec-example-list spec))
+
 (defparameter +builtins+
   (list
    ;; lists
@@ -116,6 +121,9 @@ name (symbols and keywords match each other) and return the next element."
    "EQUAL?" #'equal "EQ?" #'eq "NULL?" #'null
    "LIST?" #'listp "SYMBOL?" #'symbolp "STRING?" #'stringp "NUMBER?" #'numberp
    "FILTER" #'b-filter "GET-PROPERTY" #'b-get-property
+   ;; first-class specs
+   "SPEC-INVARIANTS" #'b-spec-invariants "SPEC-INVARIANT" #'b-spec-invariant
+   "SPEC-EXAMPLES" #'b-spec-examples
    ;; strings & symbols
    "STRING" #'string "STRING=" #'string= "STRING<" #'string<
    "STRING-EQUAL" #'string-equal

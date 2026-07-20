@@ -1,7 +1,7 @@
 # allisp 設計決定書
 
 日付: 2026-07-15
-更新: 2026-07-18
+更新: 2026-07-20
 状態: v1 実装済み
 
 allisp は、思考・分析・業務手順などを S 式で表現した `.lisp` ファイルを
@@ -244,6 +244,83 @@ loweringする。生成コードは全体が解決済みの場合だけ決定論
 - 全ファイル実行後、成功/失敗件数と失敗ファイル名の一覧をサマリーとして stderr に出す。
 - `--refresh` / `--strict` / `--model` / `--backend` / `--dry-run` / `--no-explore` /
   `--plugin` は全ファイルに一様に適用する(ファイル単位の個別上書きは提供しない)。
+
+### 26. `defspec` / `check-spec` = 仕様の第一級構文(2026-07-20 追加)
+- 決定24 の plist 慣習を専用構文に昇格する。`(defspec name . clauses)` は条項を
+  **未評価データ**のまま検査して束縛する。値は `:function` を名前で補った条項 plist
+  そのもので、従来の plist 慣習(`document-spec` 等の動詞句、`get-property`)と互換。
+- スキーマ検査は決定論的(オラクルなし): トップ条項の重複 = `:spec-duplicate-clause`、
+  `:invariants` の条項名重複 = `:spec-duplicate-invariant`、`(:name "1文")` 形でない
+  不変条件・`:in`/`:out` を欠く実例 = `:spec-malformed-clause`。違反はエラー値(決定13)
+  になり、何も束縛しない。
+- `def` 系と同様に**束縛した値を返す**(決定17)。result に仕様全文が残り、chain の
+  名前復元・`allisp diff` の名前照合(`defspec` を def 系に追加)がそのまま効く。
+- アクセサ `spec-invariants` / `spec-invariant` / `spec-examples` は決定論的ビルトイン。
+- `(check-spec name [:model M] [:fresh F])` は各不変条件を **1 条項 = 1 オラクル呼び出し**で
+  `(lambda (in out) ...)` 述語へ lowering し、全実例へ決定論的に適用する。
+  述語のプロンプトには当該条項と `:signature` しか入らない(合成フォームを囲みトップ
+  レベルにも使う)ため、**1 条項の編集はその条項の述語キャッシュだけを無効化**する
+  (決定4・5 の粒度を条項に細分)。実例の追加・編集は LLM 呼び出しゼロで再検査される。
+- 1 組の (in, out) で判定できない条項(冪等性など)はオラクルが intermediate-code を
+  返し、`:skipped` に理由付きで記録される(弱い検査への近似を禁止)。違反が 1 件でも
+  あれば値は `:spec-violation` のエラー値になり、`:detail` の `(spec-check ...)` が
+  どの条項がどの実例で偽かを名指しする。実行主体は常に決定論的評価器(決定19 整合)。
+- `defspec` / `check-spec` は予約語。
+
+### 27. `derive` = 派生台帳、`allisp spec status` = 鮮度検査(2026-07-20 追加)
+- `(derive <path> :from <spec名|(名...)> :via <生成フォーム>)` は generate-file の
+  上位構文。書き出しは `%generate-file` へそのまま委譲する(dry-run、非 .lisp
+  ターゲットの文字列規約、provenance、キャッシュ挙動はすべて決定16 のまま)。
+- 成功時にプロジェクトルートの **`.allisp/derive.lisp`**(git 管理推奨)へ
+  `(derivation :v 1 :target ... :source ... :from ... :from-sha256 ... :via ...
+  :target-sha256 ... :generated-at ...)` を target キーで上書き記録する。
+  `:from-sha256` は正規化した条項 plist の print の sha256。**defspec の条項が
+  未評価データである**(決定26)ため、このハッシュは評価なしにソースの再読で
+  再計算でき、status のゼロコスト性が成立する。
+- `allisp spec status [<root>]` は台帳を読み、1 target = 1 S 式で
+  `(fresh ...)` / `(stale ...)`(ソースの defspec 条項がハッシュ不一致) /
+  `(drifted ...)`(target のバイト列が生成時と不一致 = 手編集) /
+  `(missing ...)` / `(unknown ...)`(記録ソースに defspec が見つからない等)を出力する。
+  exit は全 fresh = 0、それ以外 = 1(diff(1) 規約)。**LLM 呼び出しゼロ**。
+- これにより決定24 の「派生物を手で直すな」が規律から機械検査に変わる。stale の解消は
+  ソースの再実行(仕様不変ならキャッシュリプレイでバイト同一に戻り fresh 復帰 = $0)。
+- `:from` の各名前は評価環境で仕様(リスト値)に束縛されていなければエラー値。
+  status の鮮度判定は記録された `:source` ファイル内の defspec に限る(他ファイル
+  由来の仕様は `unknown` と報告する)。`derive` は予約語。
+
+### 28. `probe-spec` = 仕様の穴の能動探索(2026-07-20 追加)
+- `(probe-spec <spec> [:focus (条項名...)] [:model M] [:fresh F])` は決定24 の
+  query-spec 慣習(受動・単一質問)を一般化した特殊形式: オラクルに条項間の矛盾と
+  未規定の入力領域を**能動的に**探索させる。
+- spec 指定子は pure 相当で決定論的に評価する(未束縛は即エラー値、オラクル浪費なし。
+  決定23 の入力評価と同じ)。
+- 応答契約は「`(spec-findings :spec <名> :count <n> :findings (...))` 1 式」(決定6 の枠内)。
+  各 finding は intermediate-code(決定19 の不活性データ): `:why` が矛盾・沈黙する
+  条項名を、`:how` が決着させる `:examples` 条項を指す。穴がなければ `:findings ()`。
+- 生成物は**実行しない**(`oracle-eval :execute nil`、決定23 と同機構、trace は
+  `:status :generated`)。評価器は形を検査して findings を正規化し、不適合応答は
+  `:invalid-probe-response` のエラー値にする。
+- キャッシュ粒度は**意図的に仕様全体**(仕様は文脈同梱でプロンプトに入る): 穴は条項の
+  組に宿るため、どの条項の編集も再探索を要する。check-spec の条項単位キャッシュとの
+  対比を docs に明記する。`:focus` はプロンプトの監査節に入るため自然に別キーになる。
+- `probe-spec` は予約語。
+
+### 29. `verify` = 外部テスト実行ゲート(2026-07-20 追加)
+- `(verify <コマンド文字列> [:targets (パス...)] [:expect N])` は**不活性な登録フォーム**。
+  評価時には検証レコード `(verification ... :status :pending)` を返して run に登録する
+  だけで、外部コードを一切実行しない(決定19「実行主体は Lisp か外部ツール」を維持)。
+- 実行は CLI 層の明示フラグ **`allisp run --verify`** の下でのみ: 全トップレベル
+  フォームの評価と全ファイル生成の**後**、result 書き出しの前に、登録順に
+  `sh -c <コマンド>`(cwd = ソースファイルのディレクトリ)で実行する。LLM は非関与。
+- exit が `:expect`(既定 0)と一致すればレコードは `:status :passed` に完成し、
+  不一致なら **result 上のそのフォームの値が `:verification-failed` のエラー値**
+  (`:detail` に exit・stderr 末尾)に書き換わる。決定13 の部分評価・exit 規約と
+  `allisp diff` の感度分析にそのまま乗る。`--strict` では最初の失敗で残りを
+  `:skipped` にして打ち切る。dry-run は実行せず予告のみ。
+- 成功時、`:targets` のうち台帳(決定27)に載っており**生成時とバイト同一**の
+  ファイルへ `:verified-at` を刻む。`spec status` は `(fresh ... :verified t)` と
+  報告する(編集済みファイルの検証は仕様について何も証明しないため刻まない)。
+- `verify` は予約語。
 
 ## 実装で確定した追加セマンティクス(2026-07-15 実装時)
 

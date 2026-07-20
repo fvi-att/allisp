@@ -18,7 +18,8 @@ plists of its (result ...) forms; other forms are ignored."
   "The defined name when FORM is a def-family top-level form, else NIL."
   (when (and (consp form) (symbolp (car form)) (consp (cdr form)))
     (when (member (symbol-name (car form))
-                  '("DEF" "DEFVAR" "DEFPARAMETER" "DEFINE" "DEFUN" "DEFMACRO")
+                  '("DEF" "DEFVAR" "DEFPARAMETER" "DEFINE" "DEFUN" "DEFMACRO"
+                    "DEFSPEC")
                   :test #'string=)
       (let ((name (second form)))
         (cond ((and name (symbolp name)) name)

@@ -7,6 +7,7 @@ usage:
   allisp run <dir> [options]
   allisp --one-liner \"<form>...\" [options]
   allisp diff <old.result.lisp> <new.result.lisp>
+  allisp spec status [<project-root>]
 
   Evaluate an allisp source file or expression string. Defined forms evaluate deterministically;
   unbound forms are lowered to Lisp code by the LLM oracle; only fully resolved
@@ -20,6 +21,9 @@ usage:
   Diff mode compares two result files: def-family results match by name,
   others by form; each differing value prints as one (changed|added|removed ...)
   form. Exit 0 when identical, 1 when they differ. No LLM call.
+  Spec status reads the derivation ledger (.allisp/derive.lisp, written by
+  (derive ...)) and prints one (fresh|stale|drifted|missing|unknown ...) form
+  per derived artifact. Exit 0 when everything is fresh, 1 otherwise. No LLM call.
 
 options:
   --backend <b> oracle CLI (claude | codex), default claude
@@ -31,13 +35,16 @@ options:
   --refresh     ignore the oracle cache and re-ask every oracle form
   --strict      stop at the first error instead of embedding error values
   --dry-run     no LLM calls; report which forms would go to the oracle
+  --verify      after all forms evaluate, execute registered (verify ...)
+                commands (external tests); a failing command becomes an error
+                value in the result file (run mode only)
   --no-explore  forbid the oracle to read the repository (agentic context off)
   --plugin <git-url[#revision]>
                 fetch and load a trusted ASDF syntax plugin (repeatable)
 "))
 
 (defun parse-options (args)
-  (let (refresh strict dry-run model backend plugins no-explore out-dir)
+  (let (refresh strict dry-run model backend plugins no-explore out-dir verify)
     (loop while args
           for option = (pop args)
           do (cond
@@ -45,6 +52,7 @@ options:
                ((string= option "--strict") (setf strict t))
                ((string= option "--dry-run") (setf dry-run t))
                ((string= option "--no-explore") (setf no-explore t))
+               ((string= option "--verify") (setf verify t))
                ((string= option "--model")
                 (unless args (error "--model needs a value"))
                 (setf model (pop args)))
@@ -58,32 +66,39 @@ options:
                 (unless args (error "--plugin needs a Git URL"))
                 (push (pop args) plugins))
                (t (error "unknown option: ~a" option))))
-    (values refresh strict dry-run model backend (nreverse plugins) no-explore out-dir)))
+    (values refresh strict dry-run model backend (nreverse plugins) no-explore out-dir verify)))
 
 (defun main (argv)
   (handler-case
       (cond
         ((and (string= (or (first argv) "") "run") (second argv))
-         (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir)
+         (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir verify)
              (parse-options (cddr argv))
            (uiop:quit (if (uiop:directory-exists-p (second argv))
                           (run-directory (second argv)
                                         :refresh refresh :strict strict
                                         :dry-run dry-run :model model :backend-name backend :plugins plugins
-                                        :agentic (not no-explore) :out-dir out-dir)
+                                        :agentic (not no-explore) :out-dir out-dir :verify verify)
                           (run-file (second argv)
                                     :refresh refresh :strict strict
                                     :dry-run dry-run :model model :backend-name backend :plugins plugins
-                                    :agentic (not no-explore) :out-dir out-dir)))))
+                                    :agentic (not no-explore) :out-dir out-dir :verify verify)))))
+        ((and (string= (or (first argv) "") "spec")
+              (string= (or (second argv) "") "status"))
+         (when (cdddr argv)
+           (error "spec status takes at most one project root"))
+         (uiop:quit (spec-status (or (third argv) (uiop:getcwd)))))
         ((and (string= (or (first argv) "") "diff") (second argv) (third argv))
          (when (cdddr argv)
            (error "diff takes exactly two result files"))
          (uiop:quit (diff-results (second argv) (third argv))))
         ((and (string= (or (first argv) "") "--one-liner") (second argv))
-         (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir)
+         (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir verify)
              (parse-options (cddr argv))
            (when out-dir
              (error "--out-dir only applies to run mode"))
+           (when verify
+             (error "--verify only applies to run mode"))
            (uiop:quit (run-one-liner (second argv)
                                      :refresh refresh :strict strict
                                      :dry-run dry-run :model model :backend-name backend :plugins plugins

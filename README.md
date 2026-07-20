@@ -33,37 +33,62 @@ input re-evaluates the same code deterministically without calling the LLM.
 
 A natural-language spec cannot be the canonical record: it drifts, nothing
 checks it, and every reader parses it differently. In allisp the spec is a
-formal object — `def` bindings of invariants and examples — and everything a
-human or CI consumes is generated from it, never the other way around:
+first-class language object — `defspec` binds named invariant clauses and
+examples, schema-checked before anything else runs — and everything a human
+or CI consumes is generated from it, never the other way around:
 
-- **readable document** — the oracle renders the spec for people
-- **test oracle** — examples and invariants are lowered to runnable tests
-- **implementation** — generated to pass the test oracle, in any target language
+```lisp
+(defspec slugify
+  :signature (:in (title string) :out (slug string))
+  :invariants ((:no-edge-hyphen "the slug never starts or ends with a hyphen") ...)
+  :examples   ((:in "Hello, World!" :out "hello-world") ...))
+
+(check-spec slugify)                       ; invariants x examples, contradictions named
+(derive "output/test_slugify.py"           ; test oracle, recorded in the derivation ledger
+  :from slugify
+  :via (lower-to-pytest :spec slugify :import-from "slugify"))
+(derive "output/slugify.py"                ; implementation, generated to pass the tests
+  :from slugify
+  :via (implement-to-pass :spec slugify :test-file "output/test_slugify.py"
+                          :language "python 3, standard library only"))
+(verify "python3 -m pytest output/test_slugify.py"
+  :targets ("output/test_slugify.py" "output/slugify.py"))
+```
+
+- **`check-spec`** lowers each invariant clause to a predicate (one cached
+  oracle call per clause) and applies it to every example deterministically —
+  a contradiction between clauses is named before any artifact is generated.
+- **`derive`** generates the artifact exactly like `generate-file` and records
+  spec-clause and file hashes in a ledger. **`allisp spec status`** later
+  reports each artifact as `fresh`, `stale` (spec edited), or `drifted`
+  (artifact hand-edited) with zero LLM calls.
+- **`verify`** registers the external test command; `allisp run --verify`
+  executes it after generation, and a failing test lands in the result file as
+  a first-class error value.
+- **`probe-spec`** audits the spec itself: the oracle does not invent answers
+  for corners the clauses leave open — it returns findings whose `:why` names
+  the conflicting clauses and whose `:how` says which example to add. Asking a
+  formal model finds the hole that prose would have papered over.
 
 Code generation is delegated to the LLM; execution never is. Generated Lisp
 runs only under the deterministic evaluator, and generated Python or Markdown
 is written out as text for external tools to run. An unchanged spec replays
-every artifact from cache, byte-identical, with no LLM call — the derived
-artifacts cannot drift from the record they came from. Edit one clause and
-only the forms that reference it are re-generated.
-
-Questions about the spec also go through the formal model, not prose.
-[sample/12-spec-as-source.lisp](sample/12-spec-as-source.lisp) is the whole
-loop in one file, and its final form asks about a corner the invariants
-deliberately leave open. The oracle does not pick an answer: it returns
-`intermediate-code` whose `:reason` names the two conflicting invariants and
-whose `:how` says which example to add to the spec to settle it. Asking a
-formal model finds the hole that prose would have papered over.
+every artifact from cache, byte-identical, with no LLM call — and the ledger
+turns "derived artifacts must not drift" from a discipline into a machine
+check. Edit one clause and only the predicates and artifacts that reference
+it are re-generated.
 
 ```sh
-bin/allisp run sample/12-spec-as-source.lisp     # 4 oracle calls, cached
-python3 -m pytest sample/output/test_slugify.py  # implementation vs. test oracle
-bin/allisp run sample/12-spec-as-source.lisp     # replay: 4 hits, no LLM call
+bin/allisp run sample/16-verify-pipeline.lisp --verify  # spec → check → tests → impl → pytest
+allisp spec status                                      # every artifact fresh & verified?
+bin/allisp run sample/16-verify-pipeline.lisp --verify  # replay: all hits, no LLM call
 ```
 
-A step-by-step walkthrough of this workflow — how to structure a spec, order
-the generation forms, and turn an `intermediate-code` answer back into a spec
-clause — is in [docs/spec-driven.md](docs/spec-driven.md) (Japanese).
+A step-by-step walkthrough — how to structure a spec, check it, order the
+derivations, and turn a probe finding back into a spec clause — is in
+[docs/spec-driven.md](docs/spec-driven.md) (Japanese). The same workflow
+also works without the dedicated syntax, on plain `def` plists and
+`generate-file`: [sample/12-spec-as-source.lisp](sample/12-spec-as-source.lisp).
 
 ## Judgments no CPU could compute
 
@@ -176,9 +201,11 @@ allisp run <file.lisp> --backend codex  # use the authenticated Codex CLI oracle
 allisp run <file.lisp> --model opus  # change the default model (sonnet | opus | haiku)
 allisp run <file.lisp> --no-explore  # disable the oracle's repository exploration (Read/Glob/Grep)
 allisp run <file.lisp> --out-dir results/  # write result/trace files under results/ instead of output/
+allisp run <file.lisp> --verify      # after evaluation, run registered (verify ...) commands (external tests)
 allisp --one-liner "(+ 1 2)"         # evaluate the forms in the string and print the last value
 allisp run thought.lisp --plugin 'https://example.com/review-syntax.git#<commit-sha>'
 allisp diff old.result.lisp new.result.lisp  # which premises changed, and which conclusions changed with them
+allisp spec status                   # freshness of every derived artifact (fresh | stale | drifted | ...)
 ```
 
 `--one-liner` accepts multiple forms.

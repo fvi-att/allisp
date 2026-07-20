@@ -1,5 +1,24 @@
 (in-package #:allisp)
 
+;; ---------------------------------------------------------------- plist utils
+
+(defparameter +missing+ '#:missing
+  "Sentinel distinguishing an absent keyword argument from an explicit NIL.")
+
+(defun safe-getf (list key)
+  "GETF that tolerates non-plist junk (odd tails, dotted lists).
+Returns the value or +MISSING+."
+  (loop for tail = list then (cddr tail)
+        while (and (consp tail) (consp (cdr tail)))
+        when (eq (car tail) key)
+          return (cadr tail)
+        finally (return +missing+)))
+
+(defun proper-list-p (x)
+  (loop for tail = x then (cdr tail)
+        do (cond ((null tail) (return t))
+                 ((not (consp tail)) (return nil)))))
+
 ;; ---------------------------------------------------------------- values
 
 (defstruct (closure (:print-function
@@ -64,6 +83,9 @@
   (errors nil)
   (trace nil)
   (loaded (make-hash-table :test #'equal))
+  ;; (verify ...) records registered during evaluation, newest first. The
+  ;; runner executes them after all top-level forms when --verify is given.
+  (verifications nil)
   (n 0) (hits 0) (misses 0))
 
 (defvar *run* nil

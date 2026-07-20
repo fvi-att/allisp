@@ -200,6 +200,120 @@ allisp diff before/plan.result.lisp after/plan.result.lisp
 (markdown->lisp "runbook.md" :out "generated/runbook.lisp" :eval t)
 ```
 
+## 仕様の第一級構文（defspec / check-spec / derive / probe-spec / verify）
+
+仕様駆動の運用パターン（[spec-driven.md](spec-driven.md)）を支える専用構文。
+いずれも既存の実行境界の上に成り立つ: コード生成は LLM、実行は常に決定論的評価器か外部ツールである。
+
+### defspec — 仕様を束縛する
+
+```lisp
+(defspec slugify
+  :signature (:in (title string) :out (slug string))
+  :invariants
+  ((:only-chars "the slug contains only lowercase ascii letters, digits, and single hyphens")
+   (:no-edge-hyphen "the slug never starts or ends with a hyphen"))
+  :examples
+  ((:in "Hello, World!" :out "hello-world")))
+```
+
+- 条項は**未評価データ**として検査・束縛される。値は `:function` を名前で補った条項 plist そのもので、
+  素の `def` + plist で書いた仕様と互換（既存の生成動詞句や `get-property` はそのまま動く）。
+- スキーマ検査は決定論的（オラクルなし）。トップ条項の重複は `:spec-duplicate-clause`、
+  不変条件名の重複は `:spec-duplicate-invariant`、`(:name "1文")` 形でない不変条件や
+  `:in`/`:out` を欠く実例は `:spec-malformed-clause` のエラー値になり、**何も束縛されない**。
+- `def` 系と同じく評価値は**束縛した値**。result に仕様全文が残り、chain の名前復元と
+  `allisp diff` の名前照合が効く。
+- アクセサ（決定論的ビルトイン）: `(spec-invariants s)` → 条項名リスト、
+  `(spec-invariant s :no-edge-hyphen)` → 条項文、`(spec-examples s)` → 実例リスト。
+
+### check-spec — 不変条件×実例の決定論的検査
+
+```lisp
+(check-spec slugify [:model M] [:fresh F])
+;; 全緑: (spec-check :spec slugify :checked 8 :violations () :skipped (...))
+;; 違反: (error :type :spec-violation :detail (spec-check ... :violations ((:invariant :no-edge-hyphen :example (:in "!!!" :out "-")))))
+```
+
+- 各不変条件を **1 条項 = 1 オラクル呼び出し**で `(lambda (in out) ...)` 述語へ lowering し、
+  実行ゲートを通過した述語を全実例へ決定論的に適用する。
+- 述語のプロンプトには**当該条項と `:signature` しか入らない**ため、1 条項の編集は
+  その条項の述語キャッシュだけを無効化する。**実例の追加・編集は LLM 呼び出しゼロ**で再検査される。
+- 1 組の (in, out) で判定できない条項（冪等性など）は intermediate-code が返り、
+  `:skipped` に理由付きで記録される。弱い検査への近似は禁止されている。
+- 違反が 1 件でもあれば値は `:spec-violation` のエラー値になり、どの条項がどの実例で
+  偽かが名指しされる。条項間の矛盾は、その矛盾に触れる実例を足した瞬間に検出される
+  （実例なしの矛盾検出は probe-spec の担当）。
+
+### derive — 派生の台帳化
+
+```lisp
+(derive "output/test_slugify.py"
+  :from slugify
+  :via (lower-to-pytest :spec slugify :import-from "slugify"))
+```
+
+- `generate-file` の上位構文。書き出し・dry-run・非 `.lisp` ターゲットの文字列規約・
+  キャッシュ挙動はすべて `generate-file` と同一（内部で委譲する）。
+- 加えて、成功時にプロジェクトルートの **`.allisp/derive.lisp`**（git 管理推奨）へ
+  「何がどの仕様（条項ハッシュ）からどのファイル（バイトハッシュ）へ派生したか」を記録する。
+- `:from` は仕様名（またはリスト）。束縛されていなければ `:derive-unknown-spec` のエラー値になり、
+  オラクルは呼ばれない。
+
+### allisp spec status — 鮮度検査（CLI）
+
+```sh
+allisp spec status [<project-root>]
+```
+
+台帳の各 target について 1 S 式を出力する。**LLM 呼び出しゼロ**。
+
+- `(fresh :target ...)` — 仕様も生成物も生成時のまま（`:verified t` が付けば `--verify` 済み）
+- `(stale :target ... :from <spec>)` — ソースの defspec 条項が変わった。ソースを再実行すれば解消
+- `(drifted :target ...)` — 生成物が手編集された。直したい内容は仕様側の条項に書くこと
+- `(missing :target ...)` / `(unknown :target ...)` — 生成物が消えた / 記録ソースに defspec が見つからない
+
+exit code は全 fresh = 0、それ以外 = 1（diff(1) 規約）。鮮度判定は defspec の条項が
+**未評価データ**であることに依拠する: ソースを読み直して条項をハッシュするだけで、評価は不要。
+
+### probe-spec — 仕様の穴の能動探索
+
+```lisp
+(probe-spec slugify [:focus (:collapse :no-edge-hyphen)] [:model M] [:fresh F])
+;; => (spec-findings :spec slugify :count 1
+;;      :findings ((intermediate-code
+;;                   :reason (:why ":collapse demands one hyphen while :no-edge-hyphen forbids it"
+;;                            :how "add (:in \"!!!\" :out \"\") to :examples") ...)))
+```
+
+- query-spec 慣習（受動・単一質問）の一般化。オラクルが条項間の矛盾と未規定の入力領域を
+  能動的に探索し、各穴を intermediate-code（`:why` = 矛盾条項、`:how` = 決着させる実例）として返す。
+- 生成物は**実行されない**（`markdown->lisp` と同じ `:execute nil` 経路）。穴がなければ `:findings ()`。
+  応答が契約に合わなければ `:invalid-probe-response` のエラー値。
+- キャッシュ粒度は**意図的に仕様全体**: 穴は条項の組に宿るため、どの条項を編集しても再探索される
+  （check-spec の条項単位キャッシュとの対比）。`:focus` で監査対象の条項を絞れる（別キャッシュキー）。
+- spec 指定子の評価は決定論的で、未束縛なら即エラー値（オラクルは呼ばれない）。
+
+### verify — 外部テスト実行ゲート
+
+```lisp
+(verify "python3 -m pytest output/test_slugify.py"
+  :targets ("output/test_slugify.py" "output/slugify.py")
+  :expect 0)
+```
+
+- フォーム自体は**不活性**: 評価は検証レコード `(verification ... :status :pending)` を返して
+  登録するだけで、外部コードを実行しない。allisp の実行主体は常に決定論的評価器か外部ツールであり、
+  外部ツールを起動するのは CLI 層の明示フラグである。
+- **`allisp run <file|dir> --verify`** を付けると、全トップレベルフォームの評価と全ファイル生成の後、
+  result 書き出しの前に、登録順に `sh -c <コマンド>`（cwd = ソースファイルのディレクトリ）で実行する。
+- exit が `:expect`（既定 0）と一致すればレコードは `:status :passed` に完成する。不一致なら
+  result 上のそのフォームの値が `:verification-failed` のエラー値（exit・stderr 末尾付き）になり、
+  終了コード・`--strict`・`allisp diff` の感度分析にそのまま乗る。
+- 成功時、`:targets`（ソースファイル基準の相対パス）のうち台帳に載っており**生成時とバイト同一**の
+  ファイルに verified が刻まれ、`spec status` が `(fresh ... :verified t)` と報告する。
+- LLM は非関与。`--dry-run` では実行せず予告のみ。
+
 ## 非決定的な論理探索
 
 `goal` で事実と規則を登録し、`solve` で Prolog 風の深さ優先探索を行える。
@@ -277,7 +391,7 @@ allisp diff before/plan.result.lisp after/plan.result.lisp
   思考用 DSL の自由な記法を許容するためである。
 - `t` と `nil` 以外の CL シンボルは見えない。
   許可リストにない名前は、確実にオラクルへ渡る。
-- **特殊形式**：`quote`、`quasiquote`、`if`、`cond`、`when`、`unless`、`let`、`let*`、`lambda`、`progn`、`and`、`or`、`defun`、`define`、`defmacro`、`def`、`defvar`、`defparameter`、`setq`、`setf`、`push`、`incf`、`decf`、`@use`、`llm`、`pure`、`fix`、`defer`、`deprecate`、`result`、`intermediate-code`、`markdown->lisp`
+- **特殊形式**：`quote`、`quasiquote`、`if`、`cond`、`when`、`unless`、`let`、`let*`、`lambda`、`progn`、`and`、`or`、`defun`、`define`、`defmacro`、`def`、`defvar`、`defparameter`、`setq`、`setf`、`push`、`incf`、`decf`、`@use`、`llm`、`pure`、`fix`、`defer`、`deprecate`、`result`、`intermediate-code`、`markdown->lisp`、`probe-spec`、`verify`
 - **managed memory組み込み**：`allocate-memory-block`、`memory-block-write`、`memory-block-read`、`managed-memory-block-p`
 
 ### 保留・非推奨の判断
@@ -288,4 +402,6 @@ allisp diff before/plan.result.lisp after/plan.result.lisp
 - `(deprecate code :reason reason ...)` は `code` を通常どおり評価し、評価結果を
   `(deprecate value :deprecated t :reason value ...)` として返す。これにより、非推奨である
   こととその理由を、評価後も結果 S 式に残せる。
-- **組み込みマクロ**：`generate-file`、`goal`、`constraint`、`solve`
+- **組み込みマクロ**：`generate-file`、`goal`、`constraint`、`solve`、`defspec`、`check-spec`、`derive`
+- **仕様アクセサ組み込み**：`spec-invariants`、`spec-invariant`、`spec-examples`
+- **予約語**：`result`、`fix`、`markdown->lisp`、`defspec`、`check-spec`、`derive`、`probe-spec`、`verify`（ユーザー DSL の演算子名には使えない）

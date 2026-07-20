@@ -18,9 +18,6 @@
 (define-condition escalate-request (condition)
   ((form :initarg :form :reader escalate-form)))
 
-(defparameter +missing+ '#:missing
-  "Sentinel distinguishing an absent keyword argument from an explicit NIL.")
-
 (defvar *oracle-string-hint* nil
   "When true, oracle prompts ask for the value as one Lisp string literal.
 Bound by generate-file around the body evaluation for non-.lisp targets,
@@ -39,6 +36,21 @@ passes get their own cache entries.")
 conversion section: the document T is to be converted into allisp forms with
 prose forbidden. Bound by MARKDOWN->LISP. The document is part of the prompt,
 so each document revision gets its own cache entry.")
+
+(defvar *oracle-spec-predicate-hint* nil
+  "When true, the oracle prompt gains a spec-predicate section: the target
+form carries ONE invariant clause plus the signature of a defspec, and the
+oracle must lower it to a (lambda (in out) ...) predicate. Bound by
+CHECK-SPEC per clause. The target form contains only that clause, so each
+clause gets its own cache entry and editing one clause re-lowers only its
+predicate.")
+
+(defvar *oracle-probe-hint* nil
+  "When true, the oracle prompt gains a spec-audit section: the referenced
+spec is to be searched for unspecified corners and conflicting invariant
+clauses, answered as one (spec-findings ...) of inert intermediate-code
+entries. Bound by PROBE-SPEC; a list value restricts the audit to the named
+clauses (and, being part of the prompt, gets its own cache entry).")
 
 ;; ---------------------------------------------------------------- entry
 
@@ -86,11 +98,6 @@ so each document revision gets its own cache entry.")
      ;; value position) — degrade to a direct oracle call.
      (oracle-eval form env))
     (t (oracle-eval form env))))
-
-(defun proper-list-p (x)
-  (loop for tail = x then (cdr tail)
-        do (cond ((null tail) (return t))
-                 ((not (consp tail)) (return nil)))))
 
 ;; ---------------------------------------------------------------- application
 
@@ -172,15 +179,6 @@ mix keywords and forms freely; unmatched keys default instead of erroring."
                                 (and default (a-eval default env))
                                 found)))))))))))
 
-(defun safe-getf (list key)
-  "GETF that tolerates non-plist junk (odd tails, dotted lists).
-Returns the value or +MISSING+."
-  (loop for tail = list then (cddr tail)
-        while (and (consp tail) (consp (cdr tail)))
-        when (eq (car tail) key)
-          return (cadr tail)
-        finally (return +missing+)))
-
 ;; ---------------------------------------------------------------- macros
 
 (defun expand-and-eval (macro form env effect)
@@ -242,8 +240,9 @@ Returns the value or +MISSING+."
     "DEFUN" "DEFINE" "DEFMACRO" "DEF" "DEFVAR" "DEFPARAMETER"
     "SETQ" "SETF" "PUSH" "INCF" "DECF"
     "@USE" "LLM" "PURE" "FIX" "DEFER" "DEPRECATE" "RESULT" "INTERMEDIATE-CODE"
-    "MARKDOWN->LISP"
-    "%GENERATE-FILE" "%GOAL" "%SOLVE" "%CONSTRAINT"))
+    "MARKDOWN->LISP" "PROBE-SPEC" "VERIFY"
+    "%GENERATE-FILE" "%GOAL" "%SOLVE" "%CONSTRAINT"
+    "%DEFSPEC" "%SPEC-CHECK" "%DERIVE"))
 
 (defparameter +special-forms+
   (let ((h (make-hash-table :test #'eq)))
@@ -384,6 +383,11 @@ Returns the value or +MISSING+."
         ((is "%GOAL") (eval-goal form env))
         ((is "%SOLVE") (eval-solve form env))
         ((is "%CONSTRAINT") (eval-constraint form env))
+        ((is "%DEFSPEC") (eval-defspec form env))
+        ((is "%SPEC-CHECK") (eval-spec-check form env))
+        ((is "%DERIVE") (eval-derive form env))
+        ((is "PROBE-SPEC") (eval-probe-spec form env))
+        ((is "VERIFY") (eval-verify form env))
         ((is "PURE")
          (let ((*pure* t))
            (eval-body rest env effect)))
@@ -583,6 +587,18 @@ make the branch fail."
   "(defmacro solve (&body clauses)
   `(%solve (quote ,clauses)))")
 
+(defparameter +defspec-macro-source+
+  "(defmacro defspec (name &body clauses)
+  `(%defspec (quote ,name) (quote ,clauses)))")
+
+(defparameter +check-spec-macro-source+
+  "(defmacro check-spec (name &body opts)
+  `(%spec-check (quote ,name) (quote ,opts)))")
+
+(defparameter +derive-macro-source+
+  "(defmacro derive (path &body opts)
+  `(%derive ,path (quote ,opts) (quote (derive ,path ,@opts))))")
+
 (defparameter +generated-by-macro-source+
   "(defmacro generated-by (generator &key source form generated-at)
   `(progn
@@ -597,7 +613,10 @@ make the branch fail."
   (dolist (source (list +generate-file-macro-source+
                         +goal-macro-source+
                         +constraint-macro-source+
-                        +solve-macro-source+) env)
+                        +solve-macro-source+
+                        +defspec-macro-source+
+                        +check-spec-macro-source+
+                        +derive-macro-source+) env)
     (let ((form (read-allisp-string source)))
       (destructuring-bind (operator name params &rest body) form
         (declare (ignore operator))
@@ -729,7 +748,8 @@ excluded because closures do not survive externalization."
   (when (and (consp form) (symbolp (first form)) (symbolp (second form)))
     (let ((head (symbol-name (first form))))
       (when (or (string= head "DEF") (string= head "DEFVAR")
-                (string= head "DEFPARAMETER") (string= head "DEFINE"))
+                (string= head "DEFPARAMETER") (string= head "DEFINE")
+                (string= head "DEFSPEC"))
         (second form)))))
 
 (defun restorable-value-p (value)
@@ -960,6 +980,293 @@ unresolvable document comes back as intermediate-code."
                      (a-eval f env)))
                  forms)))))))))
 
+;; ---------------------------------------------------------------- spec-driven forms
+
+(defun eval-defspec (form env)
+  "(defspec name . clauses): bind NAME to a first-class specification.
+Clauses are never evaluated (like the multi-form def, they are prose-like
+data), but their shape is checked deterministically before binding: duplicate
+top-level clauses, duplicate invariant names, and malformed invariants or
+examples become first-class error values and nothing is bound. Returns the
+bound value (the normalized clause plist), so result files record the whole
+spec and replay restores it by name."
+  (destructuring-bind (op name-form clauses-form) form
+    (declare (ignore op))
+    (let* ((name (a-eval name-form env))
+           (clauses (a-eval clauses-form env))
+           (origin (list* (usym "DEFSPEC") name clauses)))
+      (unless (and name (symbolp name) (not (keywordp name)))
+        (return-from eval-defspec
+          (make-error-value :spec-malformed-clause origin
+                            "defspec name must be a symbol")))
+      (let ((err (validate-spec-clauses origin clauses)))
+        (when err (return-from eval-defspec err)))
+      (let ((value (normalize-spec-clauses name clauses)))
+        (env-define env name value)
+        value))))
+
+(defun spec-apply-predicate (pred in out env)
+  "Apply a lowered invariant predicate to one example, deterministically.
+Returns (values satisfied-p errored-p); diagnostics from a predicate that
+fails to run are rolled back — the caller reports it as a skipped check."
+  (declare (ignore env))
+  (let ((*pure* t)
+        (errors-before (and *run* (run-errors *run*))))
+    (handler-case
+        (let ((v (a-apply pred (list in out))))
+          (if (allisp-error-value-p v)
+              (progn
+                (when *run* (setf (run-errors *run*) errors-before))
+                (values nil t))
+              (values (and v t) nil)))
+      (error ()
+        (when *run* (setf (run-errors *run*) errors-before))
+        (values nil t)))))
+
+(defun eval-spec-check (form env)
+  "(check-spec name [:model M] [:fresh F]): lower each invariant clause of
+the spec bound to NAME into a (lambda (in out) ...) predicate — one oracle
+call per clause, each cached under a prompt that contains only that clause
+and the signature — then apply every predicate to every example with no
+further LLM call. Contradictions between clauses surface as violations the
+moment an example touches them. Clauses that cannot be decided from a single
+(in out) pair come back as intermediate-code and are recorded under
+:skipped. Violations turn the whole check into a first-class error value."
+  (destructuring-bind (op name-form opts-form) form
+    (declare (ignore op))
+    (let* ((name (a-eval name-form env))
+           (opts (a-eval opts-form env))
+           (origin (list* (usym "CHECK-SPEC") name opts))
+           (model (let ((m (safe-getf opts :model)))
+                    (unless (eq m +missing+) (model-string m))))
+           (fresh (let ((f (safe-getf opts :fresh)))
+                    (and (not (eq f +missing+)) f))))
+      (multiple-value-bind (spec found) (env-lookup env name)
+        (unless (and found (consp spec))
+          (return-from eval-spec-check
+            (make-error-value :spec-not-found origin
+                              (format nil "~a is not bound to a spec" name))))
+        (let ((signature (spec-property spec :signature))
+              (invariants (spec-property spec :invariants))
+              (examples (spec-property spec :examples))
+              (checked 0)
+              (violations '())
+              (skipped '()))
+          (dolist (clause invariants)
+            (if (not (and (consp clause) (keywordp (first clause))))
+                (push (list :invariant clause
+                            :reason (list :why "malformed invariant clause"
+                                          :how "write the clause as (:name \"one sentence\")"))
+                      skipped)
+                (let* ((cname (first clause))
+                       (synth (list (usym "SPEC-INVARIANT-PREDICATE")
+                                    :signature signature
+                                    :invariant clause)))
+                  (multiple-value-bind (value status)
+                      ;; The synthetic form carries only this clause and the
+                      ;; signature, and becomes its own toplevel for context
+                      ;; purposes, so its cache key ignores the other clauses:
+                      ;; editing one clause re-lowers only its own predicate.
+                      (let ((*oracle-spec-predicate-hint* t)
+                            (*current-toplevel* synth))
+                        (oracle-eval synth env :model model :fresh fresh))
+                    (cond
+                      ((and (eq status :executed)
+                            (or (closure-p value) (functionp value)))
+                       (dolist (ex examples)
+                         (let ((in (spec-property ex :in))
+                               (out (spec-property ex :out)))
+                           (incf checked)
+                           (multiple-value-bind (ok errored)
+                               (spec-apply-predicate value in out env)
+                             (cond
+                               (errored
+                                (push (list :invariant cname :example ex
+                                            :reason (list :why "predicate raised an error on this example"
+                                                          :how "re-run with :fresh t or rephrase the invariant clause"))
+                                      skipped))
+                               ((not ok)
+                                (push (list :invariant cname :example ex)
+                                      violations)))))))
+                      ((eq status :executed)
+                       (push (list :invariant cname
+                                   :reason (list :why "predicate lowering did not produce a function"
+                                                 :how "re-run with :fresh t or rephrase the invariant clause"))
+                             skipped))
+                      ((eq status :intermediate)
+                       (push (list :invariant cname
+                                   :reason (let ((r (safe-getf (rest value) :reason)))
+                                             (unless (eq r +missing+) r)))
+                             skipped))
+                      ((eq status :dry-run)
+                       (push (list :invariant cname
+                                   :reason (list :why "dry-run: predicate not lowered"
+                                                 :how "run without --dry-run"))
+                             skipped))
+                      (t                ; oracle failure: error value recorded
+                       (push (list :invariant cname
+                                   :reason (list :why "oracle failure while lowering the predicate"
+                                                 :how "see the error value in this run"))
+                             skipped)))))))
+          (let ((report (list (usym "SPEC-CHECK")
+                              :spec name
+                              :checked checked
+                              :violations (nreverse violations)
+                              :skipped (nreverse skipped))))
+            (if (getf (cdr report) :violations)
+                (make-error-value :spec-violation origin report)
+                report)))))))
+
+(defun eval-derive (form env)
+  "(derive <path> :from <spec-name|(names...)> :via <generation-form>):
+generate-file plus a derivation ledger entry. Writing is delegated to the
+generate-file machinery unchanged (dry-run, the raw-string rule for
+non-.lisp targets, provenance markers). On success the ledger at
+<root>/.allisp/derive.lisp records what was derived from which spec (clause
+hash) into which file (byte hash), so `allisp spec status` can detect stale
+and hand-edited artifacts without any LLM call."
+  (destructuring-bind (op path-form opts-form origin-form) form
+    (declare (ignore op))
+    (let* ((opts (a-eval opts-form env))
+           (origin (a-eval origin-form env))
+           (from (let ((f (safe-getf opts :from)))
+                   (unless (eq f +missing+) f)))
+           (via (let ((v (safe-getf opts :via)))
+                  (unless (eq v +missing+) v))))
+      (unless via
+        (return-from eval-derive
+          (make-error-value :derive-missing-via origin
+                            ":via <generation form> is required")))
+      (let ((from-names (cond ((null from) '())
+                              ((and from (symbolp from)) (list from))
+                              ((and (consp from) (every #'symbolp from)) from))))
+        (when (and from (null from-names))
+          (return-from eval-derive
+            (make-error-value :derive-invalid-from origin
+                              ":from must be a spec name or a list of spec names")))
+        (let ((specs '()))
+          (dolist (n from-names)
+            (multiple-value-bind (v found) (env-lookup env n)
+              (unless (and found (consp v))
+                (return-from eval-derive
+                  (make-error-value :derive-unknown-spec origin
+                                    (format nil ":from ~a is not bound to a spec" n))))
+              (push (cons n v) specs)))
+          (setf specs (nreverse specs))
+          (let* ((path (a-eval path-form env))
+                 (value (eval-generate-file
+                         (list (usym "%GENERATE-FILE") path via
+                               (list +quote+ origin))
+                         env)))
+            (when (or (allisp-error-value-p value)
+                      (and *run* (run-dry-run *run*)))
+              (return-from eval-derive value))
+            (let ((root (and *run* (run-root *run*))))
+              (when root
+                (ledger-record root
+                               :target (generated-path path)
+                               :source (and *current-file*
+                                            (namestring *current-file*))
+                               :from specs
+                               :via via)))
+            value))))))
+
+(defun spec-findings-p (form)
+  (and (consp form) (symbolp (first form))
+       (string= (symbol-name (first form)) "SPEC-FINDINGS")))
+
+(defun normalize-spec-findings (form code)
+  "Validate and normalize the oracle's (spec-findings ...) audit reply."
+  (if (not (spec-findings-p code))
+      (make-error-value :invalid-probe-response form
+                        (format nil "oracle reply must be one (spec-findings ...) form, got: ~a"
+                                (form-summary code)))
+      (let* ((plist (rest code))
+             (findings (let ((f (safe-getf plist :findings)))
+                         (unless (eq f +missing+) f)))
+             (spec-name (let ((s (safe-getf plist :spec)))
+                          (unless (eq s +missing+) s))))
+        (if (not (and (listp findings)
+                      (every #'intermediate-code-p findings)))
+            (make-error-value :invalid-probe-response form
+                              ":findings must be a list of intermediate-code entries")
+            (let ((normalized (mapcar #'normalize-intermediate-code findings)))
+              (list (usym "SPEC-FINDINGS")
+                    :spec spec-name
+                    :count (length normalized)
+                    :findings normalized))))))
+
+(defun eval-probe-spec (form env)
+  "(probe-spec <spec> [:focus (clause-names...)] [:model M] [:fresh F]):
+actively audit a spec for unspecified corners and conflicting invariant
+clauses — the generalization of asking one query-spec question. The spec
+designator evaluates deterministically (an unbound name is an error value,
+never a wasted oracle call). The oracle replies with one (spec-findings ...)
+whose :findings are inert intermediate-code entries: :why names the clauses
+in tension, :how the :examples entry that would settle the hole. The
+findings are data and are never executed; an empty :findings list means the
+audit found no hole. The prompt contains the whole spec (via the usual
+context bundling), so editing any clause re-runs the audit — holes live in
+the combination of clauses, unlike check-spec's per-clause predicates."
+  (destructuring-bind (spec-form &rest opts) (cdr form)
+    (let* ((model (let ((m (safe-getf opts :model)))
+                    (unless (eq m +missing+) (model-string m))))
+           (fresh (let ((f (safe-getf opts :fresh)))
+                    (and (not (eq f +missing+)) f)))
+           (focus (let ((v (safe-getf opts :focus)))
+                    (unless (eq v +missing+) v)))
+           (spec (eval-markdown-arg spec-form env)))
+      (when (allisp-error-value-p spec)
+        (return-from eval-probe-spec spec))
+      (unless (consp spec)
+        (return-from eval-probe-spec
+          (make-error-value :invalid-probe-spec form
+                            "probe-spec needs a spec value (a defspec or def binding)")))
+      (multiple-value-bind (code status)
+          (let ((*oracle-probe-hint* (or focus t)))
+            (oracle-eval form env :model model :fresh fresh :execute nil))
+        (cond
+          ((eq status :dry-run) code)
+          ((not (eq status :generated)) code) ; oracle failure error value
+          ((intermediate-code-p code) (normalize-intermediate-code code))
+          (t (normalize-spec-findings form code)))))))
+
+(defun eval-verify (form env)
+  "(verify <command> [:targets (paths...)] [:expect N]): register an external
+verification command as an inert record — allisp itself never executes
+external code during evaluation; the executor is always the deterministic
+evaluator or an external tool. Under `allisp run --verify` the runner
+executes the registered commands after every top-level form has evaluated
+and every file has been generated, cwd = the source file's directory. A
+non-:expect exit rewrites this record into a first-class error value in the
+result file, so diff and exit codes see the failure. :targets is a literal
+list of generated paths (relative to the source file) used to stamp the
+derivation ledger as verified on success."
+  (destructuring-bind (command-form &rest opts) (cdr form)
+    (let ((command (a-eval command-form env)))
+      (unless (stringp command)
+        (return-from eval-verify
+          (make-error-value :invalid-verification form
+                            "verify command must evaluate to a string")))
+      (let ((targets (let ((v (safe-getf opts :targets)))
+                       (unless (eq v +missing+) v)))
+            (expect (let ((v (safe-getf opts :expect)))
+                      (if (eq v +missing+) 0 v))))
+        (unless (and (listp targets) (every #'stringp targets))
+          (return-from eval-verify
+            (make-error-value :invalid-verification form
+                              ":targets must be a literal list of path strings")))
+        (unless (integerp expect)
+          (return-from eval-verify
+            (make-error-value :invalid-verification form
+                              ":expect must be an integer exit code")))
+        (let ((record (list* (usym "VERIFICATION")
+                             (list :command command :targets targets
+                                   :expect expect :status :pending))))
+          (when *run*
+            (push record (run-verifications *run*)))
+          record)))))
+
 ;; ---------------------------------------------------------------- oracle
 
 (defparameter +prompt-version+ "20260718-2")
@@ -1024,7 +1331,7 @@ Rules:
 6. Never claim an effect succeeded. Only the deterministic Lisp evaluator may execute generated code.
 7. Keep natural-language strings in the language of the source (Japanese stays Japanese, English stays English).
 8. Never embed a computed result inside a string literal. Any number, count, comparison, projection, or aggregate that can be derived from the bindings below must appear as an evaluable subexpression over those bindings (e.g. (* peak (expt (+ 1 growth) 4)) rather than the prose \"about 98 per minute\"), so the evaluator computes it and a changed premise changes the value. Reserve strings for genuinely non-computable judgment, and never restate in prose a value the generated code already computes.
-~@[~a~]~@[~a~]~@[~a~]~@[~a~]
+~@[~a~]~@[~a~]~@[~a~]~@[~a~]~@[~a~]~@[~a~]
 === Relevant definitions and bindings ===
 ~a
 
@@ -1056,6 +1363,24 @@ The target form asks you to convert the markdown document below into allisp sour
 ~a~%"
                     (getf *oracle-markdown-hint* :label)
                     (getf *oracle-markdown-hint* :text)))
+          (when *oracle-spec-predicate-hint*
+            (format nil "
+=== Spec predicate mode ===
+The target form carries ONE invariant clause of a formal specification, plus the function signature. Generate EXACTLY ONE (lambda (in out) ...) — a deterministic predicate that returns non-nil iff an example whose input is IN and whose expected output is OUT is consistent with that single invariant clause.
+- Judge only this clause. Ignore every other requirement the specification might have.
+- Use only deterministic operations (list, string, number, comparison, and higher-order functions such as mapcar / every / some / filter / reduce). The evaluator resolves the lambda once and applies it to each example with no further oracle call.
+- When the clause cannot be decided by inspecting a single (in out) pair — for example it relates repeated application, several calls, the implementation, or external resources — return intermediate-code whose :why explains that and whose :how names what could decide it. Never approximate such a clause with a weaker check.~%"))
+          (when *oracle-probe-hint*
+            (format nil "
+=== Spec audit mode ===
+The target form asks you to AUDIT the referenced specification, not to answer one question about it. Search for holes: pairs of invariant clauses that conflict on some input, and regions of the input space that no clause or example determines.~@[ Restrict the audit to these invariant clauses: ~{~a~^, ~}.~]
+- Reply with EXACTLY ONE form: (spec-findings :spec <name> :count <n> :findings (<finding> ...)).
+- Each finding is an (intermediate-code :source (...) :reason (:why ... :how ...) :candidates (...)) entry. :why must name the conflicting or silent invariant clauses by their keyword names; :how must state the exact :examples entry (or invariant amendment) that would settle the hole; :candidates lists the plausible resolutions.
+- The findings are inert data and will never be executed.
+- Report only holes the clauses and examples genuinely leave open; do not invent violations. If the specification fully determines behavior, reply (spec-findings :spec <name> :count 0 :findings ()).~%"
+                    (when (consp *oracle-probe-hint*)
+                      (mapcar (lambda (k) (print-sexp k :pretty nil))
+                              *oracle-probe-hint*))))
           (when (agentic-oracle-p)
             (format nil "
 === Environment ===
@@ -1212,7 +1537,9 @@ deterministic core and rejects oracle recursion and external I/O forms."
                    (and (= (length args) 1)
                         (generated-qq-resolved-p (first args) env lexical)))
                   ((and name (member name '("LLM" "FIX" "@USE" "%GENERATE-FILE"
-                                            "MARKDOWN->LISP")
+                                            "MARKDOWN->LISP" "PROBE-SPEC"
+                                            "VERIFY" "%DEFSPEC" "%SPEC-CHECK"
+                                            "%DERIVE")
                                      :test #'string=))
                    nil)
                   ((and name (string= name "INTERMEDIATE-CODE")) nil)

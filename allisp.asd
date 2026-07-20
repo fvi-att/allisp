@@ -10,6 +10,7 @@
                (:file "backend")
                (:file "cache")
                (:file "plugin")
+               (:file "spec")
                (:file "eval")
                (:file "builtins")
                (:file "diff")
