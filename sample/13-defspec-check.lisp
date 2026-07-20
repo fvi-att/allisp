@@ -9,18 +9,25 @@
 ;;
 ;; check-spec's cache is per clause: the predicate prompt contains only that
 ;; clause and the signature. Edit one invariant and only its predicate is
-;; re-lowered; add or edit an example and the recheck costs no LLM call.
+;; re-lowered. Adding an example with an already-cached context only reapplies
+;; predicates; a new context lowers one additional reusable predicate.
 
 (defspec clamp
   :signature (:in (x number) (low number) (high number) :out (y number))
   :invariants
   ((:within-bounds "the output is between low and high inclusive")
    (:identity-inside "when x is already between low and high inclusive, the output equals x")
-   (:idempotent "clamp(clamp(x, low, high), low, high) equals clamp(x, low, high)"))
-  :examples
-  ((:in (5 0 10) :out 5)
-   (:in (-3 0 10) :out 0)
-   (:in (99 0 10) :out 10)))
+   (:idempotent "clamp(clamp(x, low, high), low, high) equals clamp(x, low, high)")))
+
+(example clamp :name :inside
+  :in (5 0 10) :out 5
+  :context "The lower bound is not greater than the upper bound.")
+(example clamp :name :below
+  :in (-3 0 10) :out 0
+  :context "The lower bound is not greater than the upper bound.")
+(example clamp :name :above
+  :in (99 0 10) :out 10
+  :context "The lower bound is not greater than the upper bound.")
 
 ;; Zero-cost reads over the bound spec (no oracle call).
 (pure (spec-invariants clamp))
@@ -29,7 +36,9 @@
 
 ;; Each checkable invariant lowers to one (lambda (in out) ...) predicate,
 ;; cached per clause, and runs against all examples deterministically.
-;; :idempotent cannot be decided from a single (in out) pair, so it comes
+;; Context predicates are lowered separately and cached by context. The three
+;; examples above share one predicate. :idempotent cannot be decided from a
+;; single (in out) pair, so it comes
 ;; back as intermediate-code and lands under :skipped instead of being
 ;; approximated by a weaker check — sample/16 hands that clause to pytest.
 (check-spec clamp)

@@ -332,12 +332,13 @@ Returns (values last-value run)."
     (signals error (allisp::make-cli-backend "other"))))
 
 (test parse-options-accepts-backend
-  (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir)
+  (multiple-value-bind (refresh strict dry-run ignore-skip model backend plugins no-explore out-dir)
       (allisp::parse-options '("--backend" "codex" "--model" "test-model"
-                               "--dry-run"))
+                               "--dry-run" "--ignore-skip"))
     (is (not refresh))
     (is (not strict))
     (is (eq t dry-run))
+    (is (eq t ignore-skip))
     (is (string= "test-model" model))
     (is (string= "codex" backend))
     (is (null plugins))
@@ -609,6 +610,14 @@ Returns (values last-value run)."
                   :out-dir (namestring out-dir))))
     (is (probe-file (merge-pathnames "up.result.lisp" out-dir)))
     (is (probe-file (merge-pathnames "up.trace.lisp" out-dir)))
+    (is (search (format nil "evaluator-version: ~a"
+                        allisp::+evaluator-version+)
+                (uiop:read-file-string
+                 (merge-pathnames "up.result.lisp" out-dir))))
+    (is (search (format nil "evaluator-version: ~a"
+                        allisp::+evaluator-version+)
+                (uiop:read-file-string
+                 (merge-pathnames "up.trace.lisp" out-dir))))
     (is (not (probe-file (merge-pathnames "output/up.result.lisp" root))))))
 
 (test generate-file-writes-raw-text-for-non-lisp-target
@@ -738,6 +747,24 @@ Returns (values last-value run)."
       (is (= 0 code))
       (is (null (allisp::read-allisp-string-all
                  (get-output-stream-string s)))))))
+
+(test diff-matches-examples-by-spec-and-name
+  (let* ((root (fresh-root))
+         (old (merge-pathnames "old-example.result.lisp" root))
+         (new (merge-pathnames "new-example.result.lisp" root)))
+    (write-lisp
+     old
+     "(result :v 3 :n 1
+       :form (example s :name :case :in 1 :out 1 :context \"old\")
+       :value (example-added :spec s :example :case))")
+    (write-lisp
+     new
+     "(result :v 3 :n 1
+       :form (example s :name :case :in 2 :out 2 :context \"new\")
+       :value (example-added :spec s :example :case))")
+    (let ((out (make-string-output-stream)))
+      (is (= 0 (allisp::diff-results old new :out out)))
+      (is (search "unchanged: 1" (get-output-stream-string out))))))
 
 (test reader-treats-ideographic-space-as-whitespace
   (is (equal (rd "(list 1 2)")
@@ -931,6 +958,80 @@ Returns (values last-value run)."
     (is (= 2 (calls run)))
     (is (allisp::intermediate-code-p v))))
 
+(test re-fix-repeats-until-intermediate-code-executes
+  (multiple-value-bind (v run)
+      (ev "(re-fix (mystery-plan 3))"
+          :responses
+          '("(intermediate-code :source (mystery-plan 3) :reason (:why \"a\" :how \"choose a\"))"
+            "(intermediate-code :source (mystery-plan 3) :reason (:why \"b\" :how \"choose b\"))"
+            "(intermediate-code :source (mystery-plan 3) :reason (:why \"c\" :how \"choose c\"))"
+            "(list :ready t)"))
+    (is (= 4 (calls run)))
+    (is (allisp::fixed-value-p v))
+    (is (equal (rd "(:ready t)")
+               (allisp::b-get-property v :value)))))
+
+(test re-fix-recursively-repairs-nested-intermediate-code
+  (multiple-value-bind (v run)
+      (ev "(re-fix (list
+                     :findings
+                     (list
+                       (intermediate-code
+                         :source (choose-runtime)
+                         :reason (:why \"runtime missing\" :how \"choose one\"))
+                       (list :nested
+                         (intermediate-code
+                           :source (choose-port)
+                           :reason (:why \"port missing\" :how \"choose one\"))))))"
+          :responses
+          '("(quote python)"
+            "8080"))
+    (is (= 2 (calls run)))
+    (let* ((findings (allisp::b-get-property v :findings))
+           (runtime (first findings))
+           (port (allisp::b-get-property (second findings) :nested)))
+      (is (allisp::fixed-value-p runtime))
+      (is (eq (rd "python") (allisp::b-get-property runtime :value)))
+      (is (allisp::fixed-value-p port))
+      (is (= 8080 (allisp::b-get-property port :value))))))
+
+(test re-fix-preserves-existing-fixed-audit-source
+  (multiple-value-bind (v run)
+      (ev "(re-fix
+             (fix
+               (intermediate-code
+                 :source (outer-choice)
+                 :reason (:why \"outer\" :how \"choose outer\"))))"
+          :responses
+          '("(quote
+              (intermediate-code
+                :source (inner-choice)
+                :reason (:why \"inner\" :how \"choose inner\")))"
+            "7"))
+    (is (= 2 (calls run)))
+    (is (allisp::fixed-value-p v))
+    (is (allisp::intermediate-code-p
+         (allisp::b-get-property v :source)))
+    (is (allisp::fixed-value-p
+         (allisp::b-get-property v :value)))
+    (is (= 7 (allisp::b-get-property
+              (allisp::b-get-property v :value)
+              :value)))))
+
+(test re-fix-obeys-round-limit
+  (multiple-value-bind (v run)
+      (ev "(re-fix
+             (intermediate-code
+               :source (never-ready)
+               :reason (:why \"a\" :how \"b\"))
+             :rounds 2)"
+          :responses
+          '("(intermediate-code :source (never-ready) :reason (:why \"c\" :how \"d\"))"
+            "(intermediate-code :source (never-ready) :reason (:why \"e\" :how \"f\"))"
+            "99"))
+    (is (= 2 (calls run)))
+    (is (allisp::intermediate-code-p v))))
+
 ;; ---------------------------------------------------------------- run-directory
 
 (defun write-lisp (path text)
@@ -1007,12 +1108,12 @@ Returns (values last-value run)."
   (multiple-value-bind (v run)
       (ev "(defspec slugify
              :signature (:in (title string) :out (slug string))
-             :invariants ((:only-chars \"only lowercase ascii\"))
-             :examples ((:in \"A\" :out \"a\")))")
+             :invariants ((:only-chars \"only lowercase ascii\")))")
     (is (= 0 (calls run)))
     (is (eq (rd "slugify") (getf v :function)))
     (is (equal (rd "(:in (title string) :out (slug string))")
                (getf v :signature)))
+    (is (null (getf v :examples)))
     (is (null (allisp::run-errors run)))))
 
 (test defspec-schema-violations-are-deterministic-error-values
@@ -1027,7 +1128,7 @@ Returns (values last-value run)."
     (is (= 0 (calls run))))
   (multiple-value-bind (v run)
       (ev "(defspec s :examples ((:in \"x\")))")
-    (is (eq :spec-malformed-clause (getf (rest v) :type)))
+    (is (eq :spec-inline-examples (getf (rest v) :type)))
     (is (= 0 (calls run))))
   ;; nothing is bound when validation fails
   (multiple-value-bind (v run)
@@ -1038,10 +1139,79 @@ Returns (values last-value run)."
 (test spec-accessors-are-deterministic
   (multiple-value-bind (v run)
       (ev "(defspec s
-             :invariants ((:no-edge \"no edge hyphen\") (:collapse \"collapse runs\"))
-             :examples ((:in \"a\" :out \"b\")))
-           (list (spec-invariants s) (spec-invariant s :no-edge) (spec-examples s))")
-    (is (equal v (rd "((:no-edge :collapse) \"no edge hyphen\" ((:in \"a\" :out \"b\")))")))
+             :invariants ((:no-edge \"no edge hyphen\") (:collapse \"collapse runs\")))
+           (example s :name :basic :in \"a\" :out \"b\"
+                      :context \"basic ASCII case\" :covers (:no-edge))
+           (list (spec-invariants s)
+                 (spec-invariant s :no-edge)
+                 (spec-example s :basic)
+                 (spec-examples-for-input s \"a\"))")
+    (is (equal v
+               (rd "((:no-edge :collapse)
+                     \"no edge hyphen\"
+                     (:name :basic :in \"a\" :out \"b\" :context \"basic ASCII case\" :covers (:no-edge))
+                     ((:name :basic :in \"a\" :out \"b\" :context \"basic ASCII case\" :covers (:no-edge))))")))
+    (is (= 0 (calls run)))))
+
+(test example-is-append-only-named-unevaluated-data
+  (multiple-value-bind (v run)
+      (ev "(defspec s :invariants ((:a \"x\")))
+           (example s :name :first :in (unknown-input)
+                      :out (unknown-output) :context \"background one\")
+           (example s :name :second :in (unknown-input)
+                      :out (other-output) :context \"background two\")
+           (spec-examples-for-input s '(unknown-input))")
+    (is (= 0 (calls run)))
+    (is (= 2 (length v)))
+    (is (eq :first (getf (first v) :name)))
+    (is (eq :second (getf (second v) :name)))))
+
+(test example-rejects-duplicate-name-and-inline-placement
+  (multiple-value-bind (v run)
+      (ev "(defspec s)
+           (example s :name :one :in 1 :out 1 :context \"first\")
+           (example s :name :one :in 2 :out 2 :context \"second\")")
+    (is (eq :example-duplicate-name (getf (rest v) :type)))
+    (is (= 0 (calls run))))
+  (multiple-value-bind (v run)
+      (ev "(defspec s)
+           (defun bad () (example s :name :nested :in 1 :out 1 :context \"x\"))
+           (bad)")
+    (is (eq :example-not-toplevel (getf (rest v) :type)))
+    (is (= 0 (calls run)))))
+
+(test example-depends-on-requires-and-recursively-hashes-source-definitions
+  (multiple-value-bind (v run)
+      (ev "(def role-table '((alice . :admin)))
+           (defun user-role (id) (get-property role-table id))
+           (defspec access :invariants ((:policy \"admins are allowed\")))
+           (example access :name :admin :in alice :out :allowed
+                    :context \"user-role reports that the user is an administrator\"
+                    :depends-on (user-role))")
+    (is (eq (rd "example-added") (first v)))
+    (let ((allisp::*run* run))
+      (let* ((record (gethash (rd "access") (allisp::run-specs run)))
+             (spec (getf record :value))
+             (deps (allisp::dependency-closure-records (rd "access") spec)))
+        (is (equal (mapcar (lambda (r) (getf r :name)) deps)
+                   (list (rd "role-table") (rd "user-role"))))
+        (is (stringp (allisp::current-spec-hash (rd "access") spec))))))
+  (multiple-value-bind (v run)
+      (ev "(defspec s)
+           (example s :name :bad :in 1 :out 1 :context \"x\"
+                    :depends-on (missing-runtime-state))")
+    (is (eq :example-dependency-not-found (getf (rest v) :type)))
+    (is (= 0 (calls run)))))
+
+(test example-rejects-defspec-dependency-cycles
+  (multiple-value-bind (v run)
+      (ev "(defspec a)
+           (defspec b)
+           (example b :name :from-a :in 1 :out 1 :context \"uses a\"
+                    :depends-on (a))
+           (example a :name :from-b :in 1 :out 1 :context \"uses b\"
+                    :depends-on (b))")
+    (is (eq :spec-dependency-cycle (getf (rest v) :type)))
     (is (= 0 (calls run)))))
 
 (test result-replay-restores-defspec-names
@@ -1052,22 +1222,65 @@ Returns (values last-value run)."
     (is (equal v (rd "(:a)")))
     (is (= 0 (calls run)))))
 
+(test result-v3-restores-examples-and-current-proof-certificates
+  (let* ((root (fresh-root))
+         (source (merge-pathnames "proof.lisp" root)))
+    (write-lisp
+     source
+     "(defspec s :invariants ((:a \"one is valid\")))
+(example s :name :one :in 1 :out 1 :context \"one remains one\")
+(check-spec s)
+(probe-spec s)")
+    (is (= 0
+           (allisp::run-file
+            source
+            :backend
+            (make-instance
+             'allisp::mock-backend
+             :responses
+             '("(lambda (in out) t)"
+               "(lambda (in out) t)"
+               "(spec-findings :spec s :complete t :count 0 :findings ())")))))
+    (let* ((result (merge-pathnames "output/proof.result.lisp" root))
+           (run (make-test-run :root root :responses '()))
+           (allisp::*run* run)
+           (allisp::*current-file* result)
+           (env (allisp::make-global-env)))
+      (dolist (form (allisp::read-allisp-file result))
+        (allisp::eval-toplevel-form form env))
+      (multiple-value-bind (spec found) (allisp::env-lookup env (rd "s"))
+        (is (not (null found)))
+        (is (eq :one (getf (first (allisp::spec-example-list spec)) :name))))
+      (is (eq :passed
+              (getf (gethash (rd "s")
+                             (allisp::run-check-certifications run))
+                    :status)))
+      (is (eq :passed
+              (getf (gethash (rd "s")
+                             (allisp::run-probe-certifications run))
+                    :status))))))
+
 ;; ---------------------------------------------------------------- check-spec
 
 (test check-spec-lowers-predicates-and-reports-violations
   (multiple-value-bind (v run)
       (ev "(defspec s
              :signature (:in (x string) :out (y string))
-             :invariants ((:short \"the output is shorter than 5 characters\"))
-             :examples ((:in \"aaa\" :out \"abcdef\") (:in \"b\" :out \"ok\")))
+             :invariants ((:short \"the output is shorter than 5 characters\")))
+           (example s :name :too-long :in \"aaa\" :out \"abcdef\"
+                      :context \"ordinary string output\")
+           (example s :name :short :in \"b\" :out \"ok\"
+                      :context \"ordinary string output\")
            (check-spec s)"
-          :responses '("(lambda (in out) (< (length out) 5))"))
-    (is (= 1 (calls run)))
+          :responses '("(lambda (in out) (< (length out) 5))"
+                       "(lambda (in out) t)"))
+    (is (= 2 (calls run)))
     (is (eq (rd "error") (first v)))
     (is (eq :spec-violation (getf (rest v) :type)))
     (let ((report (getf (rest v) :detail)))
       (is (eq (rd "spec-check") (first report)))
-      (is (= 2 (getf (rest report) :checked)))
+      (is (= 2 (getf (rest report) :invariant-checked)))
+      (is (= 2 (getf (rest report) :context-checked)))
       (is (= 1 (length (getf (rest report) :violations))))
       (is (eq :short (getf (first (getf (rest report) :violations)) :invariant))))))
 
@@ -1076,17 +1289,20 @@ Returns (values last-value run)."
       (ev "(defspec s
              :signature (:in (x string) :out (y string))
              :invariants ((:short \"output is short\")
-                          (:idempotent \"f(f(x)) equals f(x)\"))
-             :examples ((:in \"a\" :out \"ab\")))
+                          (:idempotent \"f(f(x)) equals f(x)\")))
+           (example s :name :basic :in \"a\" :out \"ab\"
+                      :context \"ordinary string output\")
            (check-spec s)"
           :responses '("(lambda (in out) (< (length out) 5))"
-                       "(intermediate-code :source (spec-invariant-predicate) :reason (:why \"relates repeated application\" :how \"needs the implementation, not one example\"))"))
-    (is (= 2 (calls run)))
+                       "(intermediate-code :source (spec-invariant-predicate) :reason (:why \"relates repeated application\" :how \"needs the implementation, not one example\"))"
+                       "(lambda (in out) t)"))
+    (is (= 3 (calls run)))
     (is (eq (rd "spec-check") (first v)))
-    (is (= 1 (getf (rest v) :checked)))
+    (is (= 1 (getf (rest v) :invariant-checked)))
+    (is (= 1 (getf (rest v) :context-checked)))
     (is (null (getf (rest v) :violations)))
     (is (= 1 (length (getf (rest v) :skipped))))
-    (is (eq :idempotent (getf (first (getf (rest v) :skipped)) :invariant)))
+    (is (eq :invariant (getf (first (getf (rest v) :skipped)) :kind)))
     (is (null (allisp::run-errors run)))))
 
 (test check-spec-unbound-name-is-error-not-oracle-call
@@ -1102,20 +1318,21 @@ Returns (values last-value run)."
     (multiple-value-bind (v1 run1)
         (ev "(defspec s
               :signature (:in (x string) :out (y string))
-              :invariants ((:a \"output shorter than 5\") (:b \"output not empty\"))
-              :examples ((:in \"x\" :out \"ok\")))
+              :invariants ((:a \"output shorter than 5\") (:b \"output not empty\")))
+             (example s :name :basic :in \"x\" :out \"ok\" :context \"ordinary output\")
              (check-spec s)"
             :run (make-test-run
                   :root root
                   :responses '("(lambda (in out) (< (length out) 5))"
-                               "(lambda (in out) (> (length out) 0))")))
+                               "(lambda (in out) (> (length out) 0))"
+                               "(lambda (in out) t)")))
       (is (eq (rd "spec-check") (first v1)))
-      (is (= 2 (calls run1))))
+      (is (= 3 (calls run1))))
     (multiple-value-bind (v2 run2)
         (ev "(defspec s
               :signature (:in (x string) :out (y string))
-              :invariants ((:a \"output shorter than 5\") (:b \"output longer than 1\"))
-              :examples ((:in \"x\" :out \"ok\")))
+              :invariants ((:a \"output shorter than 5\") (:b \"output longer than 1\")))
+             (example s :name :basic :in \"x\" :out \"ok\" :context \"ordinary output\")
              (check-spec s)"
             :run (make-test-run
                   :root root
@@ -1128,12 +1345,15 @@ Returns (values last-value run)."
       (ev "(defspec s
              :signature (:in (x string) :out (y string))
              :invariants ((:a \"clause a text\") (:b \"clause b text\")))
+           (example s :name :basic :in \"x\" :out \"ok\" :context \"ordinary output\")
            (check-spec s)"
-          :responses '("(lambda (in out) t)" "(lambda (in out) t)"))
+          :responses '("(lambda (in out) t)"
+                       "(lambda (in out) t)"
+                       "(lambda (in out) t)"))
     (declare (ignore v))
-    (is (= 2 (calls run)))
-    ;; prompts are pushed newest first: second prompt is clause :a's
-    (let ((prompt-a (second (allisp::mock-prompts (allisp::run-backend run)))))
+    (is (= 3 (calls run)))
+    ;; prompts are pushed newest first: third prompt is clause :a's
+    (let ((prompt-a (third (allisp::mock-prompts (allisp::run-backend run)))))
       (is (search "Spec predicate mode" prompt-a))
       (is (search "clause a text" prompt-a))
       (is (not (search "clause b text" prompt-a))))))
@@ -1142,26 +1362,38 @@ Returns (values last-value run)."
 
 (test derive-delegates-to-generate-file-and-records-ledger
   (let* ((root (fresh-root))
-         (source (make-empty-file (merge-pathnames "spec.lisp" root)))
+         (source (merge-pathnames "spec.lisp" root))
          (target (merge-pathnames "output/impl.py" root))
          (run (make-test-run :root root
-                             :responses '("\"x = 1\""))))
+                             :responses
+                             '("(lambda (in out) t)"
+                               "(lambda (in out) t)"
+                               "(spec-findings :spec s :complete t :count 0 :findings ())"
+                               "\"x = 1\""))))
+    (write-lisp
+     source
+     "(defspec s :invariants ((:a \"always 1\")))
+(example s :name :one :in 1 :out 1 :context \"one remains one\")
+(check-spec s)
+(probe-spec s)
+(derive \"output/impl.py\" :from s :via (implement :spec s))")
     (let ((allisp::*run* run)
           (allisp::*current-file* source)
           (env (allisp::make-global-env)))
-      (allisp::eval-toplevel-form
-       (rd "(defspec s :invariants ((:a \"always 1\")))") env)
-      (is (string= "x = 1"
-                   (allisp::eval-toplevel-form
-                    (rd "(derive \"output/impl.py\" :from s :via (implement :spec s))")
-                    env))))
-    (is (= 1 (calls run)))
+      (let ((value nil))
+        (dolist (form (allisp::read-allisp-file source))
+          (setf value (allisp::eval-toplevel-form form env)))
+        (is (string= "x = 1" value))))
+    (is (= 4 (calls run)))
     (is (probe-file target))
     (let ((entries (allisp::ledger-read root)))
       (is (= 1 (length entries)))
       (let ((plist (rest (first entries))))
         (is (equal "output/impl.py" (getf plist :target)))
         (is (equal (list (rd "s")) (getf plist :from)))
+        (is (= 2 (getf plist :v)))
+        (is (eq :passed
+                (getf (rest (first (getf plist :proofs))) :check-status)))
         (is (stringp (getf plist :target-sha256)))
         (is (equal "spec.lisp" (getf plist :source)))))))
 
@@ -1187,21 +1419,75 @@ Returns (values last-value run)."
     (is (not (probe-file (merge-pathnames "output/impl.py" root))))
     (is (null (allisp::ledger-read root)))))
 
+(test derive-requires-full-probe-not-focus
+  (multiple-value-bind (v run)
+      (ev "(defspec s :invariants ((:a \"x\")))
+           (example s :name :one :in 1 :out 1 :context \"one\")
+           (check-spec s)
+           (probe-spec s :focus (:a))
+           (derive \"output/x.py\" :from s :via (implement :spec s))"
+          :responses '("(lambda (in out) t)"
+                       "(lambda (in out) t)"
+                       "(spec-findings :spec s :complete t :count 0 :findings ())"))
+    (is (eq :derive-proof-required (getf (rest v) :type)))
+    (is (find :full-probe-required (getf (rest v) :detail)
+              :key (lambda (x) (getf x :reason))))
+    (is (= 3 (calls run)))))
+
+(test ignore-skip-allows-only-skipped-check-with-clean-probe
+  (let* ((root (fresh-root))
+         (source (make-empty-file (merge-pathnames "spec.lisp" root)))
+         (run (make-test-run
+               :root root
+               :responses
+               '("(intermediate-code :source (spec-invariant-predicate)
+                    :reason (:why \"implementation needed\" :how \"verify it\"))"
+                 "(lambda (in out) t)"
+                 "(spec-findings :spec s :complete t :count 0 :findings ())"
+                 "\"ok\""))))
+    (setf (allisp::run-ignore-skip run) t)
+    (let ((allisp::*run* run)
+          (allisp::*current-file* source)
+          (env (allisp::make-global-env)))
+      (dolist (form (allisp::read-allisp-string-all
+                     "(defspec s :invariants ((:a \"needs implementation\")))
+                      (example s :name :one :in 1 :out 1 :context \"one\")
+                      (check-spec s)
+                      (probe-spec s)"))
+        (allisp::eval-toplevel-form form env))
+      (is (string= "ok"
+                   (allisp::eval-toplevel-form
+                    (rd "(derive \"output/x.py\" :from s :via (implement :spec s))")
+                    env))))
+    (let* ((entry (first (allisp::ledger-read root)))
+           (proof (first (getf (rest entry) :proofs))))
+      (is (eq :skipped-ignored (getf (rest proof) :check-status)))
+      (is (getf (rest proof) :ignored-skips)))))
+
 ;; ---------------------------------------------------------------- spec status
 
 (test spec-status-detects-fresh-stale-drifted-missing
   (let* ((root (fresh-root))
-         (spec-text "(defspec s :invariants ((:a \"always 1\")))")
+         (spec-text
+           "(defspec s :invariants ((:a \"always 1\")))
+(example s :name :one :in 1 :out 1 :context \"one remains one\")
+(check-spec s)
+(probe-spec s)
+(derive \"output/impl.py\" :from s :via (implement :spec s))")
          (source (merge-pathnames "spec.lisp" root))
          (target (merge-pathnames "output/impl.py" root)))
     (write-lisp source spec-text)
-    (let ((run (make-test-run :root root :responses '("\"x = 1\""))))
+    (let ((run (make-test-run
+                :root root
+                :responses '("(lambda (in out) t)"
+                             "(lambda (in out) t)"
+                             "(spec-findings :spec s :complete t :count 0 :findings ())"
+                             "\"x = 1\""))))
       (let ((allisp::*run* run)
             (allisp::*current-file* source)
             (env (allisp::make-global-env)))
-        (allisp::eval-toplevel-form (rd spec-text) env)
-        (allisp::eval-toplevel-form
-         (rd "(derive \"output/impl.py\" :from s :via (implement :spec s))") env)))
+        (dolist (form (allisp::read-allisp-file source))
+          (allisp::eval-toplevel-form form env))))
     (flet ((one-status ()
              (let ((out (make-string-output-stream)))
                (let ((code (allisp::spec-status root :out out)))
@@ -1214,9 +1500,25 @@ Returns (values last-value run)."
         (is (eq (rd "fresh") (first status)))
         (is (= 0 code)))
       ;; spec clause edited in the source -> stale
-      (write-lisp source "(defspec s :invariants ((:a \"always 2\")))")
+      (write-lisp
+       source
+       "(defspec s :invariants ((:a \"always 2\")))
+(example s :name :one :in 1 :out 1 :context \"one remains one\")
+(check-spec s)
+(probe-spec s)
+(derive \"output/impl.py\" :from s :via (implement :spec s))")
       (multiple-value-bind (status code) (one-status)
         (is (eq (rd "stale") (first status)))
+        (is (= 1 code)))
+      ;; malformed top-level example is invalid, not merely stale
+      (write-lisp
+       source
+       "(defspec s :invariants ((:a \"always 1\")))
+(example s :name :one :in 1 :out 1)
+(check-spec s)
+(probe-spec s)")
+      (multiple-value-bind (status code) (one-status)
+        (is (eq (rd "invalid") (first status)))
         (is (= 1 code)))
       ;; restore the spec, hand-edit the target -> drifted
       (write-lisp source spec-text)
@@ -1237,7 +1539,7 @@ Returns (values last-value run)."
   (multiple-value-bind (v run)
       (ev "(defspec s :invariants ((:a \"x\") (:b \"y\")))
            (probe-spec s)"
-          :responses '("(spec-findings :spec s :count 1 :findings ((intermediate-code :source (audit s) :reason (:why \":a conflicts with :b on all-symbol input\" :how \"add (:in \\\"!!!\\\" :out \\\"\\\") to :examples\"))))"))
+          :responses '("(spec-findings :spec s :complete t :count 1 :findings ((intermediate-code :source (audit s) :reason (:why \":a conflicts with :b on all-symbol input\" :how \"add a named top-level example\"))))"))
     (is (= 1 (calls run)))
     (is (eq (rd "spec-findings") (first v)))
     (is (= 1 (getf (rest v) :count)))
@@ -1250,7 +1552,7 @@ Returns (values last-value run)."
   (multiple-value-bind (v run)
       (ev "(defspec s :invariants ((:a \"x\")))
            (probe-spec s)"
-          :responses '("(spec-findings :spec s :count 0 :findings ())"))
+          :responses '("(spec-findings :spec s :complete t :count 0 :findings ())"))
     (is (= 1 (calls run)))
     (is (= 0 (getf (rest v) :count)))
     (is (null (getf (rest v) :findings)))))
@@ -1273,11 +1575,12 @@ Returns (values last-value run)."
   (multiple-value-bind (v run)
       (ev "(defspec s :invariants ((:a \"x\") (:b \"y\")))
            (probe-spec s :focus (:a))"
-          :responses '("(spec-findings :spec s :count 0 :findings ())"))
+          :responses '("(spec-findings :spec s :complete t :count 0 :findings ())"))
     (declare (ignore v))
     (let ((prompt (first (allisp::mock-prompts (allisp::run-backend run)))))
       (is (search "Spec audit mode" prompt))
-      (is (search "Restrict the audit to these invariant clauses: :a" prompt)))))
+      (is (search "Restrict the audit to these invariant clauses and the relevant examples: :a"
+                  prompt)))))
 
 (test generated-code-may-not-call-spec-forms
   ;; a generated program that reaches for probe-spec stays intermediate
@@ -1349,7 +1652,11 @@ Returns (values last-value run)."
 
 (test verify-success-stamps-ledger-as-verified
   (let* ((root (fresh-root))
-         (spec-text "(defspec s :invariants ((:a \"always 1\")))")
+         (spec-text
+           "(defspec s :invariants ((:a \"always 1\")))
+(example s :name :one :in 1 :out 1 :context \"one remains one\")
+(check-spec s)
+(probe-spec s)")
          (src (merge-pathnames "spec.lisp" root)))
     (write-lisp src (format nil "~a~%~a~%~a" spec-text
                             "(derive \"output/impl.py\" :from s :via (implement :spec s))"
@@ -1358,7 +1665,11 @@ Returns (values last-value run)."
       (let ((*error-output* err))
         (is (= 0 (allisp::run-file
                   src :backend (make-instance 'allisp::mock-backend
-                                              :responses '("\"x = 1\""))
+                                              :responses
+                                              '("(lambda (in out) t)"
+                                                "(lambda (in out) t)"
+                                                "(spec-findings :spec s :complete t :count 0 :findings ())"
+                                                "\"x = 1\""))
                       :verify t)))))
     (let ((plist (rest (first (allisp::ledger-read root)))))
       (is (stringp (getf plist :verified-at)))

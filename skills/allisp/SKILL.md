@@ -30,6 +30,7 @@ PATH になければ、allisp リポジトリ内の `bin/allisp` を使う。
 | 「実行して」「評価して」「擬似実行して」 | `allisp run <file>` |
 | 「どこが LLM 行きか」「コスト見積り」「予告」 | `allisp run <file> --dry-run` |
 | 「考え直して」「再思考」「キャッシュ無視で」 | `allisp run <file> --refresh` |
+| 「check の判定不能だけ許可して derive」 | `allisp run <file> --ignore-skip` |
 | 「厳格に」「エラーで止めて」 | `allisp run <file> --strict` |
 | 「opus で」「もっと深く考えさせて」 | `allisp run <file> --model opus` |
 | 「リポジトリを読ませずに」「探索なしで」 | `allisp run <file> --no-explore` |
@@ -38,6 +39,7 @@ PATH になければ、allisp リポジトリ内の `bin/allisp` を使う。
 | 「前と結果を比べて」「前提を変えたら何が変わった?」 | `allisp diff <old.result.lisp> <new.result.lisp>` |
 | 特定の式だけ再思考したい | ソースのその式を `(llm <式> :fresh t)` で包むことを提案 |
 | 「曖昧でもいいから動くところまで」「仮定を補って実行して」 | その式を `(fix <式>)` で包むことを提案(仮定は `:code` に明示束縛される) |
+| 「intermediate-code がなくなるまで繰り返して」「入れ子もすべて解決して」 | その式を `(re-fix <式>)` で包むことを提案(各ノード既定16巡、`:rounds` で変更可) |
 
 ファイルが曖昧な場合は、現在のワークスペース内の `.lisp` ファイルを探し、
 `output/` と `.allisp/` 以下を除外した候補をユーザーに確認する。
@@ -59,7 +61,7 @@ PATH になければ、allisp リポジトリ内の `bin/allisp` を使う。
 
 出力は入力ファイルの隣の `output/` に生成される:
 
-- `<name>.result.lisp` — 各トップレベル式の `(result :v 2 :n K :form <元の式> :value <評価値>)`
+- `<name>.result.lisp` — 各トップレベル式の `(result :v 3 :n K :form <元の式> :value <評価値>)`
 - `<name>.trace.lisp` — 全オラクル呼び出しの記録(hash / model / hit・miss / 生成コード / executed・intermediate / 値)
 
 報告時は result.lisp を読み、次を要約する:

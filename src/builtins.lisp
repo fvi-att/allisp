@@ -89,6 +89,9 @@ name (symbols and keywords match each other) and return the next element."
 (defun b-spec-invariants (spec) (spec-invariant-names spec))
 (defun b-spec-invariant (spec name) (spec-invariant-text spec name))
 (defun b-spec-examples (spec) (spec-example-list spec))
+(defun b-spec-example (spec name) (spec-example-by-name spec name))
+(defun b-spec-examples-for-input (spec input)
+  (spec-examples-matching-input spec input))
 
 (defparameter +builtins+
   (list
@@ -123,7 +126,8 @@ name (symbols and keywords match each other) and return the next element."
    "FILTER" #'b-filter "GET-PROPERTY" #'b-get-property
    ;; first-class specs
    "SPEC-INVARIANTS" #'b-spec-invariants "SPEC-INVARIANT" #'b-spec-invariant
-   "SPEC-EXAMPLES" #'b-spec-examples
+   "SPEC-EXAMPLES" #'b-spec-examples "SPEC-EXAMPLE" #'b-spec-example
+   "SPEC-EXAMPLES-FOR-INPUT" #'b-spec-examples-for-input
    ;; strings & symbols
    "STRING" #'string "STRING=" #'string= "STRING<" #'string<
    "STRING-EQUAL" #'string-equal

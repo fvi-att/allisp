@@ -25,6 +25,14 @@ plists of its (result ...) forms; other forms are ignored."
         (cond ((and name (symbolp name)) name)
               ((and (consp name) (symbolp (car name))) (car name)))))))
 
+(defun example-form-key (form)
+  (when (and (consp form) (symbolp (first form))
+             (string= (symbol-name (first form)) "EXAMPLE")
+             (symbolp (second form)))
+    (let ((name (safe-getf (cddr form) :name)))
+      (when (keywordp name)
+        (list :example (second form) name)))))
+
 (defun index-result-entries (entries)
   "Alist of (key . entry) preserving order. Key = defined name for def-family
 forms, the form itself otherwise, plus an occurrence count so a form that
@@ -32,16 +40,20 @@ appears twice matches positionally."
   (let ((seen (make-hash-table :test #'equal)))
     (loop for e in entries
           for form = (getf e :form)
-          for base = (or (def-form-name form) form)
+          for base = (or (example-form-key form) (def-form-name form) form)
           collect (cons (list base (incf (gethash base seen 0))) e))))
 
 (defun write-diff-entry (out head entry &rest extra)
   (let* ((form (getf entry :form))
-         (name (def-form-name form)))
+         (name (def-form-name form))
+         (example-key (example-form-key form)))
     (write-string (print-sexp (append (list (usym head))
-                                      (if name
-                                          (list :name name)
-                                          (list :form form))
+                                      (cond
+                                        (example-key
+                                         (list :spec (second example-key)
+                                               :example (third example-key)))
+                                        (name (list :name name))
+                                        (t (list :form form)))
                                       extra))
                   out)
     (format out "~%~%")))

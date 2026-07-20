@@ -27,10 +27,12 @@ use FILE's directory."
 
 (defun write-header (out title source)
   (format out ";; allisp ~a~%;; source: ~a~%;; generated: ~a~%~
-               ;; prompt-version: ~a, default model: ~a~%~
+               ;; evaluator-version: ~a, prompt-version: ~a, default model: ~a~%~
+               ;; ignore-skip: ~a~%~
                ;; oracle: ~a calls (~a misses, ~a hits), errors: ~a~%~%"
           title (namestring source) (timestamp-string)
-          +prompt-version+ (run-model *run*)
+          +evaluator-version+ +prompt-version+ (run-model *run*)
+          (and (run-ignore-skip *run*) t)
           (run-n *run*) (run-misses *run*) (run-hits *run*)
           (length (run-errors *run*))))
 
@@ -53,7 +55,7 @@ use FILE's directory."
         (format out "~%~%")))
     (values result-path trace-path)))
 
-(defun run-file (path &key refresh strict dry-run model backend backend-name plugins (agentic t) out-dir verify)
+(defun run-file (path &key refresh strict dry-run ignore-skip model backend backend-name plugins (agentic t) out-dir verify)
   "Evaluate PATH as an allisp file. Writes result/trace next to it under
 output/, or under OUT-DIR when given. With VERIFY, registered (verify ...)
 commands run after all forms have evaluated, before the result file is
@@ -64,7 +66,8 @@ written. Returns the exit code (0 = no errors)."
          (*run* (make-run :source source :root root
                           :model (or model (backend-default-model actual-backend))
                           :backend actual-backend
-                          :refresh refresh :strict strict :dry-run dry-run))
+                          :refresh refresh :strict strict :dry-run dry-run
+                          :ignore-skip ignore-skip))
          (*current-file* source)
          (_ (load-plugins plugins root))
          (env (make-global-env))
@@ -117,7 +120,7 @@ result/trace files, sorted by filename."
   (sort (remove-if #'result-or-trace-file-p (uiop:directory-files dir "*.lisp"))
         #'string< :key #'file-namestring))
 
-(defun run-directory (dir &key refresh strict dry-run model backend backend-name plugins (agentic t) out-dir verify)
+(defun run-directory (dir &key refresh strict dry-run ignore-skip model backend backend-name plugins (agentic t) out-dir verify)
   "Run every top-level *.lisp file in DIR in filename order, each as an
 independent run-file call. Returns 1 if any file failed, else 0."
   (let* ((dir-path (uiop:ensure-directory-pathname (truename dir)))
@@ -137,6 +140,7 @@ independent run-file call. Returns 1 if any file failed, else 0."
              (let ((status
                      (handler-case
                          (run-file file :refresh refresh :strict strict :dry-run dry-run
+                                        :ignore-skip ignore-skip
                                         :model model :backend backend :backend-name backend-name
                                         :plugins plugins :agentic agentic :out-dir out-dir
                                         :verify verify)
@@ -157,7 +161,7 @@ independent run-file call. Returns 1 if any file failed, else 0."
       (format *error-output* "[allisp]   failed: ~a~%" f))
     (if any-error 1 0)))
 
-(defun run-one-liner (source-text &key refresh strict dry-run model backend backend-name root plugins (agentic t))
+(defun run-one-liner (source-text &key refresh strict dry-run ignore-skip model backend backend-name root plugins (agentic t))
   "Evaluate the allisp forms in SOURCE-TEXT and print the final value.
 Returns the exit code (0 = no errors). No result or trace files are written."
   (let* ((root (or root (find-project-root (uiop:getcwd))))
@@ -165,7 +169,8 @@ Returns the exit code (0 = no errors). No result or trace files are written."
          (*run* (make-run :source nil :root root
                           :model (or model (backend-default-model actual-backend))
                           :backend actual-backend
-                          :refresh refresh :strict strict :dry-run dry-run))
+                          :refresh refresh :strict strict :dry-run dry-run
+                          :ignore-skip ignore-skip))
          (*current-file* nil)
          (_ (load-plugins plugins root))
          (env (make-global-env))

@@ -19,9 +19,14 @@
 :function defaulted to the spec name. Compatible with the plain plist
 convention of the earlier spec-driven workflow, so existing generation verbs
 and get-property keep working on it."
-  (if (eq (safe-getf clauses :function) +missing+)
-      (list* :function name clauses)
-      clauses))
+  (let ((normalized (if (eq (safe-getf clauses :function) +missing+)
+                        (list* :function name clauses)
+                        (copy-list clauses))))
+    ;; Examples have one canonical storage location even though authoring is
+    ;; exclusively through top-level (example ...).
+    (if (eq (safe-getf normalized :examples) +missing+)
+        (append normalized (list :examples nil))
+        normalized)))
 
 (defun invariant-clause-p (clause)
   (and (consp clause)
@@ -65,16 +70,8 @@ state). No oracle is involved."
                               (format nil "invariant ~a appears twice" (first clause))))
                       (push (first clause) names))))
                  (:examples
-                  (unless (proper-list-p value)
-                    (fail :spec-malformed-clause ":examples must be a list"))
-                  (dolist (ex value)
-                    (unless (and (proper-list-p ex)
-                                 (evenp (length ex))
-                                 (not (eq (safe-getf ex :in) +missing+))
-                                 (not (eq (safe-getf ex :out) +missing+)))
-                      (fail :spec-malformed-clause
-                            (format nil "example ~a must be a plist with :in and :out"
-                                    (form-summary ex))))))))
+                  (fail :spec-inline-examples
+                        "write examples as top-level (example <spec> ...), not a :examples clause"))))
       nil)))
 
 (defun spec-invariant-clauses (spec)
@@ -98,6 +95,21 @@ keywords and plain symbols address it."
   (let ((v (spec-property spec :examples)))
     (and (listp v) v)))
 
+(defun spec-example-by-name (spec name)
+  (find name (spec-example-list spec)
+        :key (lambda (example) (spec-property example :name))
+        :test #'eq))
+
+(defun spec-examples-matching-input (spec input)
+  (remove-if-not
+   (lambda (example) (equal input (spec-property example :in)))
+   (spec-example-list spec)))
+
+(defun replace-spec-examples (spec examples)
+  (let ((copy (copy-tree spec)))
+    (setf (getf copy :examples) examples)
+    copy))
+
 ;; ---------------------------------------------------------------- clause hash
 
 (defun spec-clause-hash (name clauses)
@@ -120,6 +132,220 @@ or :NOT-FOUND. Reading only — the file is never evaluated."
               return (cddr form)
             finally (return :not-found))
     (error () :not-found)))
+
+(defun source-form-definition-info (form)
+  "Reader-only counterpart of the evaluator's definition registry."
+  (when (and (consp form) (symbolp (first form)))
+    (let ((head (symbol-name (first form)))
+          (arg (second form)))
+      (cond
+        ((member head '("DEFUN" "DEFMACRO" "DEF" "DEFVAR" "DEFPARAMETER"
+                        "DEFSPEC")
+                 :test #'string=)
+         (when (symbolp arg) (values arg (intern head :keyword))))
+        ((string= head "DEFINE")
+         (cond ((symbolp arg) (values arg :define-value))
+               ((and (consp arg) (symbolp (first arg)))
+                (values (first arg) :define-function))))))))
+
+(defun source-example-form-p (form)
+  (and (consp form) (symbolp (first form))
+       (string= (symbol-name (first form)) "EXAMPLE")))
+
+(defun source-spec-hash (source-path target-name)
+  "Reconstruct TARGET-NAME, its top-level examples, and transitive declared
+dependencies from SOURCE-PATH. Returns (values HASH NIL), or
+(values NIL deterministic-error-detail)."
+  (handler-case
+      (let ((definitions (make-hash-table :test #'eq))
+            (specs (make-hash-table :test #'eq))
+            (example-names (make-hash-table :test #'eq))
+            (context-totals (make-hash-table :test #'eq))
+            (derived (make-hash-table :test #'eq))
+            (order 0))
+        (dolist (form (read-allisp-file source-path))
+          (incf order)
+          (multiple-value-bind (name kind) (source-form-definition-info form)
+            (when name
+              (when (and (eq kind :defspec) (gethash name specs))
+                (return-from source-spec-hash
+                  (values nil (list :type :spec-redefined :form form))))
+              (let ((value
+                      (when (eq kind :defspec)
+                        (let ((err (validate-spec-clauses form (cddr form))))
+                          (when err
+                            (return-from source-spec-hash
+                              (values nil (rest err))))
+                          (normalize-spec-clauses name (cddr form))))))
+                (let ((record (list :name name :kind kind :form form
+                                    :order order :value value)))
+                  (setf (gethash name definitions) record)
+                  (when (eq kind :defspec)
+                    (setf (gethash name specs) record
+                          (gethash name example-names)
+                          (make-hash-table :test #'eq)
+                          (gethash name context-totals) 0))))))
+          (when (source-example-form-p form)
+            (let* ((name (second form))
+                   (fields (cddr form))
+                   (record (and (symbolp name) (gethash name specs)))
+                   (schema (plist-schema-error
+                            fields +example-allowed-fields+
+                            '(:name :in :out :context))))
+              (when schema
+                (return-from source-spec-hash
+                  (values nil (list :type :example-malformed
+                                    :form form :detail schema))))
+              (unless record
+                (return-from source-spec-hash
+                  (values nil (list :type :example-spec-not-found
+                                    :form form))))
+              (when (gethash name derived)
+                (return-from source-spec-hash
+                  (values nil (list :type :example-after-derive
+                                    :form form))))
+              (let* ((spec (spec-property record :value))
+                     (example-name (spec-property fields :name))
+                     (context (spec-property fields :context))
+                     (covers (let ((v (safe-getf fields :covers)))
+                               (unless (eq v +missing+) v)))
+                     (deps (let ((v (safe-getf fields :depends-on)))
+                             (unless (eq v +missing+) v))))
+                (unless (keywordp example-name)
+                  (return-from source-spec-hash
+                    (values nil (list :type :example-invalid-name :form form))))
+                (when (gethash example-name (gethash name example-names))
+                  (return-from source-spec-hash
+                    (values nil (list :type :example-duplicate-name :form form))))
+                (unless (and (stringp context)
+                             (> (length
+                                 (string-trim
+                                  '(#\Space #\Tab #\Newline #\Return)
+                                  context))
+                                0)
+                             (<= (length context) +example-context-limit+))
+                  (return-from source-spec-hash
+                    (values nil (list :type :example-invalid-context :form form))))
+                (when (> (+ (gethash name context-totals) (length context))
+                         +spec-context-limit+)
+                  (return-from source-spec-hash
+                    (values nil (list :type :spec-context-too-large :form form))))
+                (when (not (eq (safe-getf fields :covers) +missing+))
+                  (unless (and covers (proper-list-p covers)
+                               (every #'keywordp covers)
+                               (= (length covers)
+                                  (length (remove-duplicates covers :test #'eq)))
+                               (every (lambda (key)
+                                        (member key (spec-invariant-names spec)
+                                                :test #'eq))
+                                      covers))
+                    (return-from source-spec-hash
+                      (values nil (list :type :example-invalid-covers
+                                        :form form)))))
+                (when (not (eq (safe-getf fields :depends-on) +missing+))
+                  (unless (and deps (proper-list-p deps)
+                               (every (lambda (x)
+                                        (and x (symbolp x) (not (keywordp x))
+                                             (gethash x definitions)))
+                                      deps)
+                               (= (length deps)
+                                  (length (remove-duplicates deps :test #'eq))))
+                    (return-from source-spec-hash
+                      (values nil (list :type :example-dependency-not-found
+                                        :form form)))))
+                (setf (gethash example-name (gethash name example-names)) t
+                      (gethash name context-totals)
+                      (+ (gethash name context-totals) (length context))
+                      (getf record :value)
+                      (replace-spec-examples
+                       spec (append (spec-example-list spec)
+                                    (list (copy-tree fields))))))))
+          (when (and (consp form) (symbolp (first form))
+                     (string= (symbol-name (first form)) "DERIVE"))
+            (let* ((from (safe-getf (cddr form) :from))
+                   (names (cond ((symbolp from) (list from))
+                                ((and (listp from) (every #'symbolp from)) from)
+                                (t '()))))
+              (dolist (name names)
+                (setf (gethash name derived) t)))))
+        ;; A cycle is an invalid source even though the hash walker below is
+        ;; cycle-safe; runtime example registration rejects the same graph.
+        (labels ((spec-deps (name)
+                   (let ((record (gethash name specs)))
+                     (remove-if-not
+                      (lambda (dep) (gethash dep specs))
+                      (and record
+                           (remove-duplicates
+                            (loop for ex in
+                                  (spec-example-list
+                                   (spec-property record :value))
+                                  append
+                                  (or (spec-property ex :depends-on) '()))
+                            :test #'eq)))))
+                 (reaches (start goal seen)
+                   (or (eq start goal)
+                       (and (not (member start seen :test #'eq))
+                            (some (lambda (next)
+                                    (reaches next goal (cons start seen)))
+                                  (spec-deps start))))))
+          (maphash
+           (lambda (name record)
+             (declare (ignore record))
+             (when (some (lambda (dep) (reaches dep name '()))
+                         (spec-deps name))
+               (return-from source-spec-hash
+                 (values nil (list :type :spec-dependency-cycle
+                                   :spec name)))))
+           specs))
+        (let ((target (gethash target-name specs)))
+          (unless target
+            (return-from source-spec-hash (values nil :not-found)))
+          (let ((seen (make-hash-table :test #'eq))
+                (records '()))
+            (labels ((direct (spec)
+                       (remove-duplicates
+                        (loop for ex in (spec-example-list spec)
+                              append (or (spec-property ex :depends-on) '()))
+                        :test #'eq))
+                     (visit (name)
+                       (unless (or (eq name target-name) (gethash name seen))
+                         (setf (gethash name seen) t)
+                         (let ((record (gethash name definitions)))
+                           (when record
+                             (push record records)
+                             (dolist (sym
+                                      (form-symbols
+                                       (if (eq (spec-property record :kind)
+                                               :defspec)
+                                           (spec-property record :value)
+                                           (spec-property record :form))))
+                               (when (gethash sym definitions) (visit sym)))
+                             (when (eq (spec-property record :kind) :defspec)
+                               (dolist (dep
+                                        (direct (spec-property record :value)))
+                                 (visit dep))))))))
+              (dolist (dep (direct (spec-property target :value))) (visit dep)))
+            (setf records
+                  (sort records #'<
+                        :key (lambda (r) (spec-property r :order))))
+            (values
+             (sha256-hex
+              (print-sexp
+               (list
+                :spec (spec-property target :value)
+                :dependencies
+                (mapcar
+                 (lambda (record)
+                   (list (spec-property record :name)
+                         (if (eq (spec-property record :kind) :defspec)
+                             (spec-property record :value)
+                             (spec-property record :form))))
+                 records))
+               :pretty nil))
+             nil))))
+    (error (e)
+      (values nil (list :type :source-read-error
+                        :detail (princ-to-string e))))))
 
 ;; ---------------------------------------------------------------- ledger
 
@@ -161,22 +387,29 @@ otherwise the absolute namestring."
         (format out "~%~%")))
     path))
 
-(defun ledger-record (root &key target source from via)
+(defun ledger-record (root &key target source from via proofs ignore-skip)
   "Insert or replace the ledger entry for TARGET. FROM is an alist of
 (spec-name . bound-value); the recorded hash is over the normalized clause
 plist, which is exactly what spec-clause-hash recomputes from the source."
   (let* ((rel-target (root-relative target root))
          (entry (list* (usym "DERIVATION")
-                       (list :v 1
+                       (list :v 2
                              :target rel-target
                              :source (and source (root-relative source root))
                              :from (mapcar #'car from)
                              :from-sha256
                              (mapcar (lambda (pair)
-                                       (list (car pair)
-                                             (sha256-hex
-                                              (print-sexp (cdr pair) :pretty nil))))
+                                       (let ((proof (find (car pair) proofs
+                                                          :key #'first)))
+                                         (list (car pair)
+                                               (or (spec-property
+                                                    (rest proof) :sha256)
+                                                   (sha256-hex
+                                                    (print-sexp (cdr pair)
+                                                                :pretty nil))))))
                                      from)
+                             :proofs proofs
+                             :ignore-skip (and ignore-skip t)
                              :via via
                              :target-sha256 (and (uiop:file-exists-p target)
                                                  (file-sha256 target))
@@ -197,6 +430,7 @@ plist, which is exactly what spec-clause-hash recomputes from the source."
   "One status S-expression for a ledger ENTRY. Zero LLM calls: freshness is
 decided by re-reading the source's defspec clauses and re-hashing files."
   (let* ((plist (cdr entry))
+         (version (or (spec-property plist :v) 1))
          (rel-target (spec-property plist :target))
          (target (merge-pathnames rel-target
                                   (uiop:ensure-directory-pathname root)))
@@ -206,6 +440,9 @@ decided by re-reading the source's defspec clauses and re-hashing files."
                                        (uiop:ensure-directory-pathname root))))
          (recorded-hash (spec-property plist :target-sha256)))
     (cond
+      ((or (not (integerp version)) (< version 2))
+       (list (usym "UNKNOWN") :target rel-target
+             :detail "legacy derivation ledger entry; re-run the source to record proof metadata"))
       ((not (uiop:file-exists-p target))
        (list (usym "MISSING") :target rel-target
              :detail "target file does not exist; re-run the source file"))
@@ -222,26 +459,39 @@ decided by re-reading the source's defspec clauses and re-hashing files."
       (t
        (let ((stale nil) (unknown nil))
          (dolist (name (spec-property plist :from))
-           (let ((clauses (find-defspec-clauses source name))
+           (multiple-value-bind (current source-error)
+               (source-spec-hash source name)
+             (let (
                  (recorded (second (find name (spec-property plist :from-sha256)
                                          :key #'first))))
-             (cond ((eq clauses :not-found) (setf unknown name))
+             (cond (source-error
+                    (setf unknown (list name source-error)))
                    ((not (and (stringp recorded)
-                              (string= (spec-clause-hash name clauses) recorded)))
-                    (setf stale name)))))
+                              (string= current recorded)))
+                    (setf stale name))))))
          (cond
            (stale
             (list (usym "STALE") :target rel-target :from stale
                    :detail "spec clauses changed since generation; re-run the source file to regenerate"))
            (unknown
-            (list (usym "UNKNOWN") :target rel-target :from unknown
-                   :detail "spec not found as a defspec in the recorded source"))
+            (if (and (consp unknown) (consp (second unknown)))
+                (list (usym "INVALID") :target rel-target :spec (first unknown)
+                      :error (second unknown))
+                (list (usym "UNKNOWN") :target rel-target :from unknown
+                      :detail "spec not found as a defspec in the recorded source")))
            (t
-            (list* (usym "FRESH") :target rel-target
+            (let* ((proofs (spec-property plist :proofs))
+                   (proof (and proofs (first proofs))))
+              (append (list (usym "FRESH") :target rel-target)
+                      (when proof
+                        (list :check-status
+                              (spec-property (rest proof) :check-status)
+                              :probe-status
+                              (spec-property (rest proof) :probe-status)))
                    (when (and (spec-property plist :verified-at)
                               (equal (spec-property plist :verified-sha256)
                                      recorded-hash))
-                     (list :verified t))))))))))
+                        (list :verified t)))))))))))
 
 (defun spec-status (root &key (out *standard-output*))
   "Report the freshness of every ledger entry under ROOT as one S-expression

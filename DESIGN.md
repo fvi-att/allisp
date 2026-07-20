@@ -185,6 +185,16 @@ loweringする。生成コードは全体が解決済みの場合だけ決定論
   生成コード内の `fix` は `llm` と同様に未解決扱い。`fix` は予約語。
 - オラクル呼び出しは通常の trace / キャッシュ機構に乗る(リプレイは決定論)。
 
+### 22a. `re-fix` = intermediate-code の再帰的自動解決(2026-07-20 追加)
+- `(re-fix <form> [:rounds N] [:model M] [:fresh F])` は `<form>` の評価値を木として走査し、
+  その中のすべての `intermediate-code` に Fix モードを反復適用する。
+- 各ノードは実行に至ると `fix` と同じ `fixed` 監査レコードへ置換する。実行値にさらに
+  intermediate-code が含まれる場合は再帰的に処理するが、監査用 `:source` / `:code` は
+  再処理しない。
+- 変化し続ける未解決 lowering による無限ループを防ぐため、`:rounds` はノードごとの上限
+  (既定 16)。上限到達時は最後の intermediate-code をその位置に残す。
+- `re-fix` は予約語であり、オラクル生成コード内では `fix` と同様に未解決扱いにする。
+
 ### 23. `markdown->lisp` = markdown 文書のプログラム化(2026-07-18 追加)
 - `(markdown->lisp <source> [:from :file|:text] [:out <path.lisp>] [:model M] [:fresh F] [:eval E])`
   は markdown で書かれたプロンプト・指示をオラクルに変換させ、allisp フォーム列として返す特殊形式。
@@ -296,7 +306,8 @@ loweringする。生成コードは全体が解決済みの場合だけ決定論
   決定23 の入力評価と同じ)。
 - 応答契約は「`(spec-findings :spec <名> :count <n> :findings (...))` 1 式」(決定6 の枠内)。
   各 finding は intermediate-code(決定19 の不活性データ): `:why` が矛盾・沈黙する
-  条項名を、`:how` が決着させる `:examples` 条項を指す。穴がなければ `:findings ()`。
+  条項名を、`:how` が決着させる具体的な `:examples` 条項または invariant 改訂を指す。
+  穴がなければ `:findings ()`。
 - 生成物は**実行しない**(`oracle-eval :execute nil`、決定23 と同機構、trace は
   `:status :generated`)。評価器は形を検査して findings を正規化し、不適合応答は
   `:invalid-probe-response` のエラー値にする。
@@ -321,6 +332,26 @@ loweringする。生成コードは全体が解決済みの場合だけ決定論
   ファイルへ `:verified-at` を刻む。`spec status` は `(fresh ... :verified t)` と
   報告する(編集済みファイルの検証は仕様について何も証明しないため刻まない)。
 - `verify` は予約語。
+
+### 30. `example` / context proof gate(2026-07-20 追加)
+- `defspec` 内の inline `:examples` authoring を廃止し、同一ファイル内の先行
+  `defspec` に対する top-level `(example spec :name ... :in ... :out ...
+  :context ... [:covers ...] [:depends-on ...])` に一本化する。全値は未評価データ。
+  `:name` が spec 内 identity であり、同一入力・同一内容の重複は許可する。
+- `:context` は補足ではなく、構造化困難な背景・条件分岐を記述する規範的要件。
+  ただし evaluator の security/execution/output protocol は上書きできない。
+  1件4000文字、spec合計16000文字。`check-spec` は invariant predicate と分離して
+  signature + context + covers + 宣言依存から再利用可能 predicate を lowering する。
+- `:depends-on` は同一ファイルの先行 top-level 定義だけを許可し、再帰 closure の
+  正規化S式を spec hash と監査promptへ含める。plugin依存と defspec 循環は禁止。
+  依存先が defspec なら check/probe 証明も再帰的に必須。
+- `probe-spec` は invariant/invariant、invariant/context、context/context、
+  未規定領域、実装から観測不能なcontext条件、正当化不能な依存を監査する。
+  応答は `:complete t|nil` を持ち、focus付き監査は derive 証明にならない。
+- `derive` は現 spec hash に一致する check（違反0）と完全 probe
+  (`:complete t`, findings 0)を必須にする。skip は通常停止し、明示的
+  `--ignore-skip` だけが許可する。通常エラー・違反・probe finding/未完了は回避不能。
+  result はv3、derive ledgerはv2へ更新し、hash/evaluator/prompt/modelを完全一致で復元する。
 
 ## 実装で確定した追加セマンティクス(2026-07-15 実装時)
 

@@ -35,6 +35,9 @@ options:
   --refresh     ignore the oracle cache and re-ask every oracle form
   --strict      stop at the first error instead of embedding error values
   --dry-run     no LLM calls; report which forms would go to the oracle
+  --ignore-skip allow derive after an otherwise successful check-spec whose
+                only unresolved results are :skipped; never ignores violations
+                or an incomplete/non-clean probe-spec
   --verify      after all forms evaluate, execute registered (verify ...)
                 commands (external tests); a failing command becomes an error
                 value in the result file (run mode only)
@@ -44,13 +47,14 @@ options:
 "))
 
 (defun parse-options (args)
-  (let (refresh strict dry-run model backend plugins no-explore out-dir verify)
+  (let (refresh strict dry-run ignore-skip model backend plugins no-explore out-dir verify)
     (loop while args
           for option = (pop args)
           do (cond
                ((string= option "--refresh") (setf refresh t))
                ((string= option "--strict") (setf strict t))
                ((string= option "--dry-run") (setf dry-run t))
+               ((string= option "--ignore-skip") (setf ignore-skip t))
                ((string= option "--no-explore") (setf no-explore t))
                ((string= option "--verify") (setf verify t))
                ((string= option "--model")
@@ -66,22 +70,25 @@ options:
                 (unless args (error "--plugin needs a Git URL"))
                 (push (pop args) plugins))
                (t (error "unknown option: ~a" option))))
-    (values refresh strict dry-run model backend (nreverse plugins) no-explore out-dir verify)))
+    (values refresh strict dry-run ignore-skip model backend
+            (nreverse plugins) no-explore out-dir verify)))
 
 (defun main (argv)
   (handler-case
       (cond
         ((and (string= (or (first argv) "") "run") (second argv))
-         (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir verify)
+         (multiple-value-bind (refresh strict dry-run ignore-skip model backend plugins no-explore out-dir verify)
              (parse-options (cddr argv))
            (uiop:quit (if (uiop:directory-exists-p (second argv))
                           (run-directory (second argv)
                                         :refresh refresh :strict strict
-                                        :dry-run dry-run :model model :backend-name backend :plugins plugins
+                                        :dry-run dry-run :ignore-skip ignore-skip
+                                        :model model :backend-name backend :plugins plugins
                                         :agentic (not no-explore) :out-dir out-dir :verify verify)
                           (run-file (second argv)
                                     :refresh refresh :strict strict
-                                    :dry-run dry-run :model model :backend-name backend :plugins plugins
+                                    :dry-run dry-run :ignore-skip ignore-skip
+                                    :model model :backend-name backend :plugins plugins
                                     :agentic (not no-explore) :out-dir out-dir :verify verify)))))
         ((and (string= (or (first argv) "") "spec")
               (string= (or (second argv) "") "status"))
@@ -93,7 +100,7 @@ options:
            (error "diff takes exactly two result files"))
          (uiop:quit (diff-results (second argv) (third argv))))
         ((and (string= (or (first argv) "") "--one-liner") (second argv))
-         (multiple-value-bind (refresh strict dry-run model backend plugins no-explore out-dir verify)
+         (multiple-value-bind (refresh strict dry-run ignore-skip model backend plugins no-explore out-dir verify)
              (parse-options (cddr argv))
            (when out-dir
              (error "--out-dir only applies to run mode"))
@@ -101,7 +108,8 @@ options:
              (error "--verify only applies to run mode"))
            (uiop:quit (run-one-liner (second argv)
                                      :refresh refresh :strict strict
-                                     :dry-run dry-run :model model :backend-name backend :plugins plugins
+                                     :dry-run dry-run :ignore-skip ignore-skip
+                                     :model model :backend-name backend :plugins plugins
                                      :agentic (not no-explore)))))
         (t (usage) (uiop:quit 2)))
     (error (e)

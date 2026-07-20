@@ -40,10 +40,15 @@ or CI consumes is generated from it, never the other way around:
 ```lisp
 (defspec slugify
   :signature (:in (title string) :out (slug string))
-  :invariants ((:no-edge-hyphen "the slug never starts or ends with a hyphen") ...)
-  :examples   ((:in "Hello, World!" :out "hello-world") ...))
+  :invariants ((:no-edge-hyphen "the slug never starts or ends with a hyphen") ...))
 
-(check-spec slugify)                       ; invariants x examples, contradictions named
+(example slugify :name :hello-world
+  :in "Hello, World!" :out "hello-world"
+  :context "Apply the ASCII slug policy to an ordinary title."
+  :covers (:no-edge-hyphen))
+
+(check-spec slugify)                       ; invariants + normative contexts
+(probe-spec slugify)                       ; full conflict/hole audit
 (derive "output/test_slugify.py"           ; test oracle, recorded in the derivation ledger
   :from slugify
   :via (lower-to-pytest :spec slugify :import-from "slugify"))
@@ -55,11 +60,16 @@ or CI consumes is generated from it, never the other way around:
   :targets ("output/test_slugify.py" "output/slugify.py"))
 ```
 
-- **`check-spec`** lowers each invariant clause to a predicate (one cached
-  oracle call per clause) and applies it to every example deterministically —
-  a contradiction between clauses is named before any artifact is generated.
+- **`example`** appends named, unevaluated examples to a preceding same-file
+  `defspec`. Its required natural-language `:context` is normative; optional
+  `:covers` and `:depends-on` make traceability and runtime inputs explicit.
+- **`check-spec`** lowers invariant clauses and example contexts to reusable
+  predicates and applies them deterministically. **`derive` requires both a
+  current successful check and a complete, finding-free `probe-spec`.**
 - **`derive`** generates the artifact exactly like `generate-file` and records
-  spec-clause and file hashes in a ledger. **`allisp spec status`** later
+  spec/example/dependency proof hashes and file hashes in a ledger.
+  `--ignore-skip` can accept check skips, but never violations or probe
+  findings. **`allisp spec status`** later
   reports each artifact as `fresh`, `stale` (spec edited), or `drifted`
   (artifact hand-edited) with zero LLM calls.
 - **`verify`** registers the external test command; `allisp run --verify`
@@ -67,8 +77,9 @@ or CI consumes is generated from it, never the other way around:
   a first-class error value.
 - **`probe-spec`** audits the spec itself: the oracle does not invent answers
   for corners the clauses leave open — it returns findings whose `:why` names
-  the conflicting clauses and whose `:how` says which example to add. Asking a
-  formal model finds the hole that prose would have papered over.
+  the conflicting clauses and whose `:how` says which example or invariant
+  amendment would settle the hole. Asking a formal model finds the hole that
+  prose would have papered over.
 
 Code generation is delegated to the LLM; execution never is. Generated Lisp
 runs only under the deterministic evaluator, and generated Python or Markdown
@@ -79,9 +90,9 @@ check. Edit one clause and only the predicates and artifacts that reference
 it are re-generated.
 
 ```sh
-bin/allisp run sample/16-verify-pipeline.lisp --verify  # spec → check → tests → impl → pytest
+bin/allisp run sample/16-verify-pipeline.lisp --verify --ignore-skip
 allisp spec status                                      # every artifact fresh & verified?
-bin/allisp run sample/16-verify-pipeline.lisp --verify  # replay: all hits, no LLM call
+bin/allisp run sample/16-verify-pipeline.lisp --verify --ignore-skip  # replay
 ```
 
 A step-by-step walkthrough — how to structure a spec, check it, order the
@@ -125,6 +136,12 @@ inert and retains constraints and candidates for a later pass:
 
 Evaluate `(llm <intermediate-code>)` explicitly when more context is available
 and another lowering pass is wanted.
+
+Use `(fix <form>)` to let the oracle choose explicit, inspectable defaults for
+one intermediate result. Use `(re-fix <form>)` to repeat that process and
+recursively repair intermediate-code nested anywhere in the result value.
+Each repaired node retains its source, generated code, and executed value in a
+`fixed` record; `:rounds` limits attempts per node (default 16).
 
 During file execution, the oracle explores the repository with read-only tools
 and reads the files a form refers to before generating code (disable with

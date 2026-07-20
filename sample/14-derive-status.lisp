@@ -4,7 +4,7 @@
 ;; <project-root>/.allisp/derive.lisp records which spec (clause hash)
 ;; produced which file (byte hash).
 ;;
-;;   bin/allisp run sample/14-derive-status.lisp   ; 1 oracle call, cached
+;;   bin/allisp run sample/14-derive-status.lisp   ; checks, audits, derives
 ;;   bin/allisp spec status                        ; -> (fresh :target ...)
 ;;
 ;; `spec status` never calls the LLM: a defspec's clauses are unevaluated
@@ -23,9 +23,14 @@
   :signature (:in (name string) :out (message string))
   :invariants
   ((:begins-hello "the message begins with the word Hello")
-   (:contains-name "the message contains the input name verbatim"))
-  :examples
-  ((:in "Ada" :out "Hello, Ada!")))
+   (:contains-name "the message contains the input name verbatim")))
+
+(example greeting :name :ada
+  :in "Ada" :out "Hello, Ada!"
+  :context "Use an informal English greeting ending in an exclamation mark.")
+
+(check-spec greeting)
+(probe-spec greeting)
 
 (derive "output/greeting-spec.md"
   :from greeting

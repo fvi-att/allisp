@@ -16,6 +16,7 @@ Each file is standalone and demonstrates one evaluation path.
 | `10-generate-markdown.lisp` | Renders structured data into a Markdown report and writes it to a plain `.md` file via `generate-file`. No LLM call. |
 | `11-markdown-to-lisp.lisp` | The reverse direction: `markdown->lisp` has the oracle convert a markdown runbook into an allisp program (prose forbidden) and writes it to a `.lisp` file. |
 | `12-spec-as-source.lisp` | The spec as the formal source of truth: one `def` spec generates a readable doc, a pytest test oracle, and a Python implementation that passes it; a spec query returns `intermediate-code` naming a hole in the invariants. |
+| `15-probe.lisp` | `probe-spec` adversarially audits a repaired slugify contract for conflicting clauses and unspecified input regions. |
 
 Inspect the oracle boundary without making an LLM call:
 
@@ -94,7 +95,8 @@ document, the pytest test oracle, and the implementation (which it writes to
 pass the tests it can Read). The final `query-spec` form deliberately asks
 about an underspecified corner — an all-punctuation title, where `:collapse`
 and `:no-edge-hyphen` conflict — and comes back as `intermediate-code` whose
-`:how` names the `:examples` entry that would settle it. A rerun replays all
+`:how` names the top-level named `example` or invariant amendment that would
+settle it. A rerun replays all
 four calls from cache with no LLM call.
 
 A full walkthrough of this workflow (spec structure, form ordering, turning

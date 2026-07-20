@@ -5,10 +5,10 @@
 ;;   derive x3    readable doc, pytest test oracle, implementation + ledger
 ;;   verify       the external test run, registered for --verify
 ;;
-;;   bin/allisp run sample/16-verify-pipeline.lisp --verify
+;;   bin/allisp run sample/16-verify-pipeline.lisp --verify --ignore-skip
 ;;   python3 -m pytest sample/output/test_clamp.py   ; what --verify just ran
 ;;   bin/allisp spec status                          ; fresh & verified?
-;;   bin/allisp run sample/16-verify-pipeline.lisp --verify   ; replay: no LLM call
+;;   bin/allisp run sample/16-verify-pipeline.lisp --verify --ignore-skip
 ;;
 ;; Without --verify the verify form stays (verification ... :status :pending):
 ;; the evaluator never executes external code on its own. With --verify the
@@ -23,16 +23,20 @@
   :invariants
   ((:within-bounds "the output is between low and high inclusive")
    (:identity-inside "when x is already between low and high inclusive, the output equals x")
-   (:idempotent "clamp(clamp(x, low, high), low, high) equals clamp(x, low, high)"))
-  :examples
-  ((:in (5 0 10) :out 5)
-   (:in (-3 0 10) :out 0)
-   (:in (99 0 10) :out 10)))
+   (:idempotent "clamp(clamp(x, low, high), low, high) equals clamp(x, low, high)")))
+
+(example clamp :name :inside :in (5 0 10) :out 5
+  :context "The lower bound is not greater than the upper bound.")
+(example clamp :name :below :in (-3 0 10) :out 0
+  :context "The lower bound is not greater than the upper bound.")
+(example clamp :name :above :in (99 0 10) :out 10
+  :context "The lower bound is not greater than the upper bound.")
 
 ;; Gate: contradictions between clauses and examples stop the pipeline here,
 ;; before any artifact is generated. :idempotent is undecidable per example
 ;; pair (it lands under :skipped) — the generated pytest below covers it.
 (check-spec clamp)
+(probe-spec clamp)
 
 ;; 1. Readable document — generated from the spec, never written by hand.
 (derive "output/clamp-spec.md"

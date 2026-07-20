@@ -79,10 +79,20 @@ Returns the value or +MISSING+."
 (defstruct run
   source root backend
   (model "sonnet")
-  refresh strict dry-run
+  refresh strict dry-run ignore-skip
   (errors nil)
   (trace nil)
   (loaded (make-hash-table :test #'equal))
+  ;; Source-local state used by defspec/example and the proof gates.  These
+  ;; tables deliberately live on RUN rather than in the Lisp environment:
+  ;; result replay may restore values, but source identity and certification
+  ;; are separate facts.
+  (definitions (make-hash-table :test #'eq))
+  (specs (make-hash-table :test #'eq))
+  (check-certifications (make-hash-table :test #'eq))
+  (probe-certifications (make-hash-table :test #'eq))
+  (derived-specs (make-hash-table :test #'eq))
+  (toplevel-n 0)
   ;; (verify ...) records registered during evaluation, newest first. The
   ;; runner executes them after all top-level forms when --verify is given.
   (verifications nil)
