@@ -196,7 +196,7 @@ The license is the [GNU General Public License v3.0](LICENSE) (GPL-3.0-only).
 - Language spec (execution boundary, `llm`, `pure`, `@use`, error values, cache): [docs/language.md](docs/language.md) (Japanese)
 - Spec-driven generation guide (spec as the source of truth → docs / tests / implementation): [docs/spec-driven.md](docs/spec-driven.md) (Japanese)
 - Development guide (tests, source layout, swapping backends): [docs/development.md](docs/development.md) (Japanese)
-- Design decision history: [DESIGN.md](DESIGN.md) (Japanese)
+- Design decision: designs/allisp.lisp (Japanese)
 - Samples mixing determinism, LLM calls, and macros: [sample/README.md](sample/README.md)
 
 ## Usage
