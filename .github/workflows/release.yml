@@ -1,0 +1,162 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  SBCL_VERSION: "2.5.10"
+  QUICKLISP_DIST_VERSION: "2025-06-22"
+
+permissions:
+  contents: write
+
+jobs:
+  build-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset_name: macos-arm64
+          - os: ubuntu-latest
+            asset_name: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Roswell / Quicklisp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.roswell
+            ~/.cache/common-lisp
+          key: ${{ runner.os }}-${{ matrix.asset_name }}-roswell-${{ env.SBCL_VERSION }}-${{ env.QUICKLISP_DIST_VERSION }}-${{ hashFiles('allisp.asd') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.asset_name }}-roswell-${{ env.SBCL_VERSION }}-${{ env.QUICKLISP_DIST_VERSION }}-
+
+      - name: Install Roswell
+        run: curl -L https://raw.githubusercontent.com/roswell/roswell/release/scripts/install-for-ci.sh | sh
+
+      - name: Install pinned SBCL
+        run: |
+          ros install sbcl-bin/${{ env.SBCL_VERSION }}
+          ros use sbcl-bin/${{ env.SBCL_VERSION }}
+
+      - name: Pin Quicklisp dist
+        run: |
+          ros run --eval '(ql-dist:install-dist "http://beta.quicklisp.org/dist/quicklisp/${{ env.QUICKLISP_DIST_VERSION }}/distinfo.txt" :prompt nil)' \
+                  --eval '(quit)'
+
+      - name: Test
+        run: make test
+
+      - name: Build
+        run: make build
+
+      - name: Package
+        run: |
+          stage=allisp-${{ github.ref_name }}-${{ matrix.asset_name }}
+          mkdir "$stage"
+          cp dist/allisp "$stage/allisp"
+          cp LICENSE README.md "$stage/"
+          tar czf "$stage.tar.gz" "$stage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allisp-${{ matrix.asset_name }}
+          path: allisp-${{ github.ref_name }}-${{ matrix.asset_name }}.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    env:
+      QUICKLISP_HOME: ${{ github.workspace }}\quicklisp-home
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Quicklisp
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.QUICKLISP_HOME }}
+          key: windows-quicklisp-${{ env.SBCL_VERSION }}-${{ env.QUICKLISP_DIST_VERSION }}-${{ hashFiles('allisp.asd') }}
+          restore-keys: |
+            windows-quicklisp-${{ env.SBCL_VERSION }}-${{ env.QUICKLISP_DIST_VERSION }}-
+
+      - name: Install pinned SBCL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest -Uri "https://sourceforge.net/projects/sbcl/files/sbcl/$env:SBCL_VERSION/sbcl-$env:SBCL_VERSION-x86-64-windows-binary.msi/download" -OutFile sbcl.msi
+          Start-Process msiexec.exe -ArgumentList "/i", "$pwd\sbcl.msi", "/quiet", "/norestart", "/log", "sbcl-install.log" -Wait
+          $sbclExe = Get-ChildItem -Path "$env:ProgramFiles" -Recurse -Filter "sbcl.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sbclExe) {
+            Get-Content sbcl-install.log
+            throw "sbcl.exe not found after install"
+          }
+          echo "$($sbclExe.DirectoryName)" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Bootstrap Quicklisp
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest -Uri "https://beta.quicklisp.org/quicklisp.lisp" -OutFile quicklisp.lisp
+          sbcl --non-interactive `
+               --load quicklisp.lisp `
+               --eval "(quicklisp-quickstart:install :path #p\`"$($env:QUICKLISP_HOME.Replace('\','/'))/\`")"
+          sbcl --non-interactive `
+               --load "$env:QUICKLISP_HOME\setup.lisp" `
+               --eval "(ql-dist:install-dist \`"http://beta.quicklisp.org/dist/quicklisp/$env:QUICKLISP_DIST_VERSION/distinfo.txt\`" :prompt nil)"
+
+      - name: Test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          sbcl --non-interactive `
+               --load "$env:QUICKLISP_HOME\setup.lisp" `
+               --eval "(push #p\`"$($pwd.Path.Replace('\','/'))/\`" asdf:*central-registry*)" `
+               --eval "(ql:quickload :allisp/tests :silent t)" `
+               --eval "(uiop:quit (if (uiop:symbol-call :fiveam :run! :allisp) 0 1))"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          sbcl --non-interactive `
+               --load "$env:QUICKLISP_HOME\setup.lisp" `
+               --eval "(push #p\`"$($pwd.Path.Replace('\','/'))/\`" asdf:*central-registry*)" `
+               --eval "(ql:quickload :allisp :silent t)" `
+               --eval "(sb-ext:save-lisp-and-die \`"dist/allisp.exe\`" :executable t :save-runtime-options t :toplevel (lambda () (allisp:main (uiop:command-line-arguments))))"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "allisp-${{ github.ref_name }}-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item dist\allisp.exe "$stage\allisp.exe"
+          Copy-Item LICENSE, README.md $stage
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allisp-windows-x86_64
+          path: allisp-${{ github.ref_name }}-windows-x86_64.zip
+          if-no-files-found: error
+
+  release:
+    needs: [build-unix, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
